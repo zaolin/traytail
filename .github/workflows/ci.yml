@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (race)
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Integration tests (real session bus)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dbus
+          dbus-run-session -- go test -tags dbus_integration -count=1 ./...
+
+      - name: Coverage summary
+        if: always()
+        run: go tool cover -func=coverage.out | tail -1

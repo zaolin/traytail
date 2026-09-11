@@ -1,0 +1,7 @@
+/traytail
+coverage.out
+coverage.int.out
+coverage.merged.out
+coverage.html
+*.test
+*.out
