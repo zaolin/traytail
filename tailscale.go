@@ -100,6 +100,27 @@ type ExitNodeInfo struct {
 	Selected bool
 }
 
+// debugPrefs is the subset of `tailscale debug prefs` we care about.
+// AutoExitNode is "any" when auto:any is active and absent/empty for
+// manual selections — the only reliable way to tell auto mode from a
+// resolved concrete node.
+type debugPrefs struct {
+	AutoExitNode string `json:"AutoExitNode"`
+}
+
+// AutoExitNodeActive reports whether auto:any exit-node mode is on.
+func AutoExitNodeActive(ctx context.Context) bool {
+	out, err := run(ctx, "debug", "prefs")
+	if err != nil {
+		return false
+	}
+	var p debugPrefs
+	if json.Unmarshal([]byte(out), &p) != nil {
+		return false
+	}
+	return p.AutoExitNode != ""
+}
+
 // GetExitNodes parses the tabwriter output of `tailscale exit-node list`.
 // Columns are separated by two or more spaces so multi-word cities
 // ("Buenos Aires") survive. Own exit nodes have "-" for country/city.

@@ -234,10 +234,15 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 
 // exitSuffix labels the Exit node submenu parent with the current
 // selection. Prefers the full city/country from `exit-node list`
-// ("Exit node: Berlin"), falling back to the hostname.
+// ("Exit node: Berlin"), falling back to the hostname. Auto:any mode
+// is reported as "Auto (best)" — the resolved node is tailscaled's
+// choice, not the user's.
 func exitSuffix(exit *Peer, st *Status) string {
 	if exit == nil {
 		return ": off"
+	}
+	if AutoExitNodeActive(context.Background()) {
+		return ": Auto (best)"
 	}
 	if nodes, err := GetExitNodes(context.Background()); err == nil {
 		for _, n := range nodes {
@@ -276,11 +281,12 @@ func exitHostName(p Peer) string {
 // top of the Mullvad list so the current selection is easy to find.
 func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
 	nodes, _ := GetExitNodes(context.Background())
+	auto := exit != nil && AutoExitNodeActive(context.Background())
 
-	// Determine which hostname is active: from the peer list, resolved
-	// against the exit-node list table for nicer labels.
+	// In auto mode the concrete node is tailscaled's choice: no city or
+	// country gets marked active.
 	activeHost := ""
-	if exit != nil {
+	if exit != nil && !auto {
 		activeHost = exit.HostName
 	}
 
@@ -291,7 +297,7 @@ func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
 			}
 			a.requestRefresh()
 		}),
-		mkRadio("Auto (best)", false, func() {
+		mkRadio("Auto (best)", auto, func() {
 			if err := SetExitNode(context.Background(), "auto:any"); err != nil {
 				log.Printf("traytail: set auto exit node: %v", err)
 			}

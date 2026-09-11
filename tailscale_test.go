@@ -16,6 +16,7 @@ type fakeTailscale struct {
 	logPath string
 
 	exitNodeList string
+	debugPrefs   string
 
 	mu     sync.Mutex
 	calls  [][]string
@@ -31,15 +32,8 @@ func installFakeTailscale(t *testing.T) *fakeTailscale {
 	}
 	ft.dir = t.TempDir()
 	ft.logPath = filepath.Join(ft.dir, "calls.log")
-
-	script := "#!/bin/sh\necho \"$@\" >> " + ft.logPath + "\nif [ -f " + filepath.Join(ft.dir, "fail") + " ]; then echo 'simulated cli failure' >&2; exit 1; fi\ncat " + filepath.Join(ft.dir, "resp.txt") + " 2>/dev/null || true\n"
+	ft.rewriteScript(t)
 	binDir := filepath.Join(ft.dir, "bin")
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(binDir, "tailscale"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Cleanup(func() { os.Remove(ft.logPath) })
 	return ft
@@ -80,10 +74,36 @@ func (ft *fakeTailscale) setExitNodeList(t *testing.T, table string) {
 	if err := os.WriteFile(filepath.Join(ft.dir, "exitnodes.txt"), []byte(table), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// rewrite the CLI script to serve the table for exit-node list
-	cli := filepath.Join(ft.dir, "bin", "tailscale")
+	ft.rewriteScript(t)
+}
+
+// setDebugPrefs writes the canned `tailscale debug prefs` JSON. An
+// empty string omits the file, so `cat` yields nothing (parse fails).
+func (ft *fakeTailscale) setDebugPrefs(t *testing.T, prefsJSON string) {
+	t.Helper()
+	ft.debugPrefs = prefsJSON
+	if prefsJSON == "" {
+		ft.rewriteScript(t)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(ft.dir, "prefs.json"), []byte(prefsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ft.rewriteScript(t)
+}
+
+// rewriteScript regenerates the fake CLI so every fixture file set
+// through the setters is served for its subcommand.
+func (ft *fakeTailscale) rewriteScript(t *testing.T) {
+	t.Helper()
+	binDir := filepath.Join(ft.dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cli := filepath.Join(binDir, "tailscale")
 	script := "#!/bin/sh\necho \"$@\" >> " + ft.logPath + "\n" +
-		"if [ \"$1\" = \"exit-node\" ]; then cat " + filepath.Join(ft.dir, "exitnodes.txt") + "; exit 0; fi\n" +
+		"if [ \"$1\" = \"exit-node\" ]; then cat " + filepath.Join(ft.dir, "exitnodes.txt") + " 2>/dev/null; exit 0; fi\n" +
+		"if [ \"$1\" = \"debug\" ]; then if [ -f " + filepath.Join(ft.dir, "prefs.json") + " ]; then cat " + filepath.Join(ft.dir, "prefs.json") + "; else echo '{}'; fi; exit 0; fi\n" +
 		"if [ -f " + filepath.Join(ft.dir, "fail") + " ]; then echo 'simulated cli failure' >&2; exit 1; fi\n" +
 		"cat " + filepath.Join(ft.dir, "resp.txt") + " 2>/dev/null || true\n"
 	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {

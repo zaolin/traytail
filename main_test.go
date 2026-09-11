@@ -530,6 +530,81 @@ func TestExitNodeMenuOffClick(t *testing.T) {
 	}
 }
 
+func TestAutoExitNodeActive(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setDebugPrefs(t, `{"AutoExitNode":"any","ExitNodeID":"nYGkypCDoe11CNTRL"}`)
+	if !AutoExitNodeActive(context.Background()) {
+		t.Error("auto:any prefs should report active")
+	}
+	ft.setDebugPrefs(t, `{"ExitNodeID":"nYGkypCDoe11CNTRL"}`)
+	if AutoExitNodeActive(context.Background()) {
+		t.Error("manual selection should not report auto")
+	}
+	ft.setDebugPrefs(t, ``) // no prefs file -> empty output -> parse fails
+	if AutoExitNodeActive(context.Background()) {
+		t.Error("unparseable prefs should not report auto")
+	}
+}
+
+func TestExitSuffixAutoMode(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	ft.setDebugPrefs(t, `{"AutoExitNode":"any"}`)
+	st := &Status{BackendState: "Running"}
+	// exit peer is the auto-resolved node; must NOT show its city
+	got := exitSuffix(&Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNode: true}, st)
+	if got != ": Auto (best)" {
+		t.Errorf("auto mode suffix = %q, want ': Auto (best)'", got)
+	}
+}
+
+func TestExitNodeMenuAutoMode(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	ft.setDebugPrefs(t, `{"AutoExitNode":"any"}`)
+	a := newTestApp(t, &fakeUI{})
+	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	st := &Status{
+		BackendState: "Running",
+		Peer:         map[string]Peer{"mv": active},
+	}
+	items := a.exitNodeMenu(st, &active)
+
+	if !hasLabel(items, "● Auto (best)") {
+		t.Errorf("Auto should be active in auto mode: %v", labels(items))
+	}
+	if !hasLabel(items, "○ Off") {
+		t.Errorf("Off should be inactive: %v", labels(items))
+	}
+	// resolved node must NOT be marked and country NOT hoisted
+	mullvad := findLabel(items, "Mullvad")
+	if mullvad == nil {
+		t.Fatal("Mullvad submenu missing")
+	}
+	if hasLabel(mullvad.Submenu, "● Germany") {
+		t.Errorf("country should not be hoisted in auto mode: %v", labels(mullvad.Submenu))
+	}
+	if hasLabel(mullvad.Submenu, "● Berlin") {
+		t.Errorf("resolved city should not be marked in auto mode: %v", labels(mullvad.Submenu))
+	}
+	if !hasLabel(mullvad.Submenu, "Germany") {
+		t.Errorf("Germany should still be listed: %v", labels(mullvad.Submenu))
+	}
+}
+
+func TestExitNodeMenuAutoParentLabel(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	ft.setDebugPrefs(t, `{"AutoExitNode":"any"}`)
+	a := newTestApp(t, &fakeUI{})
+	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": active}}
+	_, _, menu := a.buildUI(st, nil)
+	if !hasLabel(menu, "Exit node: Auto (best)") {
+		t.Errorf("parent label in auto mode: %v", labels(menu))
+	}
+}
+
 func TestExitNodeMenuAutoClick(t *testing.T) {
 	ft := installFakeTailscale(t)
 	ft.setExitNodeList(t, exitNodeListFixture)
