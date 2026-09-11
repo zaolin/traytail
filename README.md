@@ -77,6 +77,11 @@ re-applies only when the home/away state flips — manual selections and
 Off stay untouched while the state is stable, and any manual pick or
 Off disables smart auto.
 
+**Deselecting the own exit node** (clicking its `●` item) applies the
+last-used Mullvad node instead — regardless of whether smart auto is
+on. Active nodes are matched by Tailscale IP, so a user-renamed device
+(`Nabara` vs `zds-nabara.tailb4e47d.ts.net`) still shows as selected.
+
 ## Notes
 
 - Exit node selection uses `tailscale set --exit-node=<hostname>`;

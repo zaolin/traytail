@@ -784,6 +784,152 @@ func TestExitNodeMenuNoNodesPlaceholder(t *testing.T) {
 	}
 }
 
+// ---- listRowActive + own-item deselect ----
+
+// TestListRowActiveByIP covers the renamed-device case: the status
+// peer's HostName is user-chosen ("Nabara") while the exit-node list
+// row carries the DNS name ("zds-nabara...."); only the Tailscale IP
+// links them.
+func TestListRowActiveByIP(t *testing.T) {
+	row := ExitNodeInfo{IP: "100.107.25.96", Hostname: "zds-nabara.tailb4e47d.ts.net", Country: "", City: ""}
+	renamed := Peer{HostName: "Nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", TailscaleIPs: []string{"100.107.25.96", "fd7a::a901:199b"}}
+
+	if !listRowActive(row, &renamed) {
+		t.Error("same Tailscale IP should match despite renamed HostName")
+	}
+	other := Peer{HostName: "Nabara", TailscaleIPs: []string{"100.99.99.99"}}
+	if listRowActive(row, &other) {
+		t.Error("different IP with unmatchable hostname should not match")
+	}
+	if listRowActive(row, nil) {
+		t.Error("nil exit peer should never match")
+	}
+}
+
+func TestListRowActiveHostnameFallback(t *testing.T) {
+	// No IP in the row (older parse): hostname fallback still works.
+	row := ExitNodeInfo{Hostname: "de-ber-wg-001.mullvad.ts.net"}
+	p := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net."}
+	if !listRowActive(row, &p) {
+		t.Error("hostname fallback should match")
+	}
+}
+
+func TestExitNodeMenuOwnActiveByIP(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	// Renamed device: HostName "Nabara", same IP as the list row.
+	active := Peer{
+		HostName:       "Nabara",
+		DNSName:        "zds-nabara.tailb4e47d.ts.net.",
+		ExitNodeOption: true,
+		Online:         true,
+		ExitNode:       true,
+		TailscaleIPs:   []string{"100.107.25.96"},
+	}
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{"own": active}}
+	items := a.exitNodeMenu(st, &active)
+	if !hasLabel(items, "● zds-nabara") {
+		t.Errorf("renamed own node should be marked active via IP: %v", labels(items))
+	}
+}
+
+func TestOwnExitItemClickDeselectsToMullvad(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	// status incl. online Mullvad peer + own node; no debug prefs needed
+	ft.setResponse(t, `{"BackendState":"Running","Peer":{
+		"own":{"HostName":"Nabara","DNSName":"zds-nabara.tailb4e47d.ts.net.","ExitNodeOption":true,"Online":true,"TailscaleIPs":["100.107.25.96"]},
+		"mv":{"HostName":"al-tia-wg-001","DNSName":"al-tia-wg-001.mullvad.ts.net.","ExitNodeOption":true,"Online":true,"Tags":["tag:mullvad-exit-node"]}
+	}}`)
+	restoreIfaceAddrs(t, nil)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	active := Peer{HostName: "Nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true, TailscaleIPs: []string{"100.107.25.96"}}
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{"own": active}}
+	items := a.exitNodeMenu(st, &active)
+
+	ownItem := findLabel(items, "● zds-nabara")
+	if ownItem == nil {
+		t.Fatalf("active own item missing: %v", labels(items))
+	}
+	ownItem.OnClick()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil || setCall[1] != "--exit-node=al-tia-wg-001" {
+		t.Fatalf("deselect own should apply last-used Mullvad, ran %v", ft.callsSoFar(t))
+	}
+	if a.smart != nil {
+		t.Error("deselect should disable smart auto")
+	}
+	if got := LoadLastMullvad(); got != "al-tia-wg-001" {
+		t.Errorf("last-used should be persisted, got %q", got)
+	}
+}
+
+func TestOwnExitItemClickInactiveSelects(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	st := &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"own": {HostName: "Nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, TailscaleIPs: []string{"100.107.25.96"}},
+		},
+	}
+	items := a.exitNodeMenu(st, nil) // no active exit
+
+	ownItem := findLabel(items, "○ zds-nabara")
+	if ownItem == nil {
+		t.Fatalf("inactive own item missing: %v", labels(items))
+	}
+	ownItem.OnClick()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil || setCall[1] != "--exit-node=zds-nabara.tailb4e47d.ts.net" {
+		t.Fatalf("inactive own click should select the node, ran %v", ft.callsSoFar(t))
+	}
+	if a.smart != nil {
+		t.Error("manual select should disable smart auto")
+	}
+}
+
+func TestApplyLastMullvadNoNodeAvailable(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	// status with no online Mullvad peers
+	ft.setResponse(t, `{"BackendState":"Running","Peer":{}}`)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	if got := a.applyLastMullvad(); got != "" {
+		t.Errorf("applyLastMullvad with no nodes = %q, want empty", got)
+	}
+	if a.smart == nil {
+		t.Error("unavailable target should not disable smart auto")
+	}
+}
+
 // ---- smart-auto state machine ----
 
 func smartTestStatus() *Status {

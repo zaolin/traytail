@@ -449,11 +449,11 @@ func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
 			continue
 		}
 		seen[base] = true
-		if !peerExitAvailable(st, n.Hostname) {
+		if !peerExitAvailableIP(st, n) {
 			continue
 		}
 		if n.Country == "" {
-			own = append(own, ownExitItem(n, hostMatches(n.Hostname, activeHost), a))
+			own = append(own, ownExitItem(n, listRowActive(n, exit), a))
 			continue
 		}
 		if _, ok := mullvad[n.Country]; !ok {
@@ -476,7 +476,27 @@ func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
 	return items
 }
 
+// listRowActive reports whether an exit-node list row is the currently
+// active exit node. Matches by Tailscale IP first (rename-proof: the
+// status peer's HostName may be user-renamed and unrelated to the DNS
+// name in the list), then falls back to hostname heuristics.
+func listRowActive(n ExitNodeInfo, exit *Peer) bool {
+	if exit == nil {
+		return false
+	}
+	if n.IP != "" {
+		for _, ip := range exit.TailscaleIPs {
+			if strings.TrimSuffix(ip, "/32") == n.IP {
+				return true
+			}
+		}
+	}
+	return hostMatches(n.Hostname, exit.HostName) || hostMatches(n.Hostname, exit.BaseName())
+}
+
 // ownExitItem builds the radio item for a self-hosted exit node.
+// Clicking the active item deselects it: traytail applies the last-used
+// Mullvad node instead (explicit user choice, disables smart auto).
 func ownExitItem(n ExitNodeInfo, active bool, a *app) MenuItem {
 	label := n.Hostname
 	if i := strings.Index(label, "."); i > 0 {
@@ -484,11 +504,40 @@ func ownExitItem(n ExitNodeInfo, active bool, a *app) MenuItem {
 	}
 	return mkRadio(label, active, func() {
 		a.disableSmartAuto()
+		if active {
+			a.applyLastMullvad()
+			a.requestRefresh()
+			return
+		}
 		if err := SetExitNode(context.Background(), n.Hostname); err != nil {
 			log.Printf("traytail: set exit node: %v", err)
 		}
 		a.requestRefresh()
 	})
+}
+
+// applyLastMullvad resolves and applies the last-used Mullvad node,
+// persisting it. Returns the applied hostname ("" when none found).
+func (a *app) applyLastMullvad() string {
+	st, err := GetStatus(context.Background())
+	if err != nil {
+		log.Printf("traytail: last-used mullvad: %v", err)
+		return ""
+	}
+	nodes, _ := GetExitNodes(context.Background())
+	target := PickMullvadNode(st, nodes, LoadLastMullvad())
+	if target == "" {
+		log.Printf("traytail: last-used mullvad: no online Mullvad node available")
+		return ""
+	}
+	StoreLastMullvad(target)
+	log.Printf("traytail: own node deselected -> applying last-used Mullvad %q", target)
+	if err := SetExitNode(context.Background(), target); err != nil {
+		log.Printf("traytail: set exit node: %v", err)
+		return ""
+	}
+	a.requestRefresh()
+	return target
 }
 
 // mullvadSubmenu builds the country submenus, hoisting the active
@@ -568,6 +617,28 @@ func peerExitAvailable(st *Status, hostname string) bool {
 		}
 		if hostMatches(hostname, p.HostName) || hostMatches(hostname, p.BaseName()) {
 			return true
+		}
+	}
+	return false
+}
+
+// peerExitAvailableIP additionally matches by Tailscale IP for
+// renamed devices whose HostName shares nothing with the DNS name.
+func peerExitAvailableIP(st *Status, n ExitNodeInfo) bool {
+	if peerExitAvailable(st, n.Hostname) {
+		return true
+	}
+	if n.IP == "" {
+		return false
+	}
+	for _, p := range st.Peer {
+		if !p.ExitNodeOption || !p.Online {
+			continue
+		}
+		for _, ip := range p.TailscaleIPs {
+			if strings.TrimSuffix(ip, "/32") == n.IP {
+				return true
+			}
 		}
 	}
 	return false
