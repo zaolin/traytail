@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -34,6 +35,20 @@ type app struct {
 	sni       trayUI
 	last      string // dedup key
 	refreshCh chan struct{}
+
+	// smart-auto state
+	smart       *smartAuto
+	execCommand func(string, ...string) *exec.Cmd // nil = global execCommand
+}
+
+// smartAuto tracks the home/away state machine. It applies the policy
+// exit node only when the home/away state flips, leaving manual picks
+// alone while the state is stable.
+type smartAuto struct {
+	mu      sync.Mutex
+	atHome  bool // last observed home state
+	primed  bool // have we observed any state yet?
+	lastMul string
 }
 
 func main() {
@@ -53,7 +68,7 @@ func main() {
 // It owns the SNI connection for the duration.
 func runApp(ctx context.Context, stop context.CancelFunc, sni trayUI) error {
 	defer sni.Close()
-	a := &app{ctx: ctx, stop: stop, sni: sni, refreshCh: make(chan struct{}, 1)}
+	a := &app{ctx: ctx, stop: stop, sni: sni, refreshCh: make(chan struct{}, 1), smart: &smartAuto{}}
 	a.registerLoop()
 	a.refresh() // initial state
 
@@ -95,6 +110,8 @@ func (a *app) refresh() {
 	}
 	profiles, _ := GetProfiles(a.ctx)
 
+	a.tickSmartAuto(st)
+
 	icon, tooltip, items := a.buildUI(st, profiles)
 	key := dedupKey(st, profiles, items)
 	if key == a.last {
@@ -102,6 +119,63 @@ func (a *app) refresh() {
 	}
 	a.last = key
 	a.sni.Update(icon, tooltip, items)
+}
+
+// tickSmartAuto runs the home/away state machine. desiredTarget
+// returns the exit node hostname to apply when the state flips.
+func (a *app) tickSmartAuto(st *Status) {
+	s := a.smart
+	if s == nil || !st.Running() {
+		return
+	}
+	lans := OwnExitNodeLANs(st)
+	home := AtHome(lans)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.primed {
+		s.primed = true
+		s.atHome = home
+		s.lastMul = LoadLastMullvad()
+		log.Printf("traytail: smart auto primed (home=%v, lastMullvad=%q)", home, s.lastMul)
+		return // first observation never applies anything
+	}
+	if home == s.atHome {
+		return // stable: manual choices stand
+	}
+	s.atHome = home
+
+	// Flipped. Determine the desired target.
+	var target string
+	if home {
+		nodes, _ := GetExitNodes(context.Background())
+		target = PickMullvadNode(st, nodes, s.lastMul)
+		if target != "" {
+			s.lastMul = target
+			StoreLastMullvad(target)
+		}
+	} else {
+		target = a.pickOwnNode(st)
+	}
+	if target == "" {
+		log.Printf("traytail: smart auto: no target for home=%v, keeping current", home)
+		return
+	}
+	log.Printf("traytail: smart auto: home=%v -> applying exit node %q", home, target)
+	if err := SetExitNode(context.Background(), target); err != nil {
+		log.Printf("traytail: smart auto: set exit node: %v", err)
+	}
+}
+
+// pickOwnNode returns the hostname of the first online own exit node
+// advertising a LAN, or "" when none is available.
+func (a *app) pickOwnNode(st *Status) string {
+	for _, p := range st.SortPeers() {
+		if p.ExitNodeOption && p.Online && !p.IsMullvad() && len(p.PrimaryRoutes) > 0 {
+			return p.HostName
+		}
+	}
+	return ""
 }
 
 // requestRefresh asks the main loop for an immediate refresh.
@@ -234,15 +308,10 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 
 // exitSuffix labels the Exit node submenu parent with the current
 // selection. Prefers the full city/country from `exit-node list`
-// ("Exit node: Berlin"), falling back to the hostname. Auto:any mode
-// is reported as "Auto (best)" — the resolved node is tailscaled's
-// choice, not the user's.
+// ("Exit node: Berlin"), falling back to the hostname.
 func exitSuffix(exit *Peer, st *Status) string {
 	if exit == nil {
 		return ": off"
-	}
-	if AutoExitNodeActive(context.Background()) {
-		return ": Auto (best)"
 	}
 	if nodes, err := GetExitNodes(context.Background()); err == nil {
 		for _, n := range nodes {
@@ -252,6 +321,64 @@ func exitSuffix(exit *Peer, st *Status) string {
 		}
 	}
 	return ": " + exitHostName(*exit)
+}
+
+// smartPrimed reports whether the smart-auto state machine has been
+// enabled (has observed a home/away state at least once).
+func (a *app) smartPrimed() bool {
+	s := a.smart
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.primed
+}
+
+// enableSmartAuto turns the smart policy on: evaluates the current
+// home state and immediately applies the matching node.
+func (a *app) enableSmartAuto() {
+	if a.smart == nil {
+		a.smart = &smartAuto{}
+	}
+	st, err := GetStatus(context.Background())
+	if err != nil {
+		log.Printf("traytail: smart auto enable: %v", err)
+		return
+	}
+	home := AtHome(OwnExitNodeLANs(st))
+	a.smart.mu.Lock()
+	a.smart.atHome = home
+	a.smart.primed = true
+	if home {
+		a.smart.lastMul = LoadLastMullvad()
+	}
+	a.smart.mu.Unlock()
+
+	var target string
+	if home {
+		nodes, _ := GetExitNodes(context.Background())
+		target = PickMullvadNode(st, nodes, a.smart.lastMul)
+		if target != "" {
+			a.smart.lastMul = target
+			StoreLastMullvad(target)
+		}
+	} else {
+		target = a.pickOwnNode(st)
+	}
+	if target == "" {
+		log.Printf("traytail: smart auto enabled (home=%v): no target yet, will apply on next flip", home)
+		return
+	}
+	log.Printf("traytail: smart auto enabled (home=%v) -> applying exit node %q", home, target)
+	if err := SetExitNode(context.Background(), target); err != nil {
+		log.Printf("traytail: smart auto: set exit node: %v", err)
+	}
+}
+
+// disableSmartAuto turns the smart policy off.
+func (a *app) disableSmartAuto() {
+	a.smart = nil
 }
 
 // exitNodeLabel picks the friendliest name for an exit node row:
@@ -275,32 +402,33 @@ func exitHostName(p Peer) string {
 	return name
 }
 
-// exitNodeMenu builds the exit node submenu: Off, Auto (best), own
+// exitNodeMenu builds the exit node submenu: Off, Auto (smart), own
 // nodes, and Mullvad nodes grouped by country (full names from
 // `tailscale exit-node list`). The active country is hoisted to the
 // top of the Mullvad list so the current selection is easy to find.
+// Auto is traytail's smart policy: away -> own exit node (home LAN
+// reachability), home -> last-used Mullvad node.
 func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
 	nodes, _ := GetExitNodes(context.Background())
-	auto := exit != nil && AutoExitNodeActive(context.Background())
+	auto := exit != nil && a.smartPrimed()
 
-	// In auto mode the concrete node is tailscaled's choice: no city or
-	// country gets marked active.
+	// In smart-auto mode traytail itself applied the concrete node, so
+	// the city IS marked active — the label shows what carries traffic.
 	activeHost := ""
-	if exit != nil && !auto {
+	if exit != nil {
 		activeHost = exit.HostName
 	}
 
 	items := []MenuItem{
 		mkRadio("Off", exit == nil, func() {
+			a.disableSmartAuto()
 			if err := SetExitNode(context.Background(), ""); err != nil {
 				log.Printf("traytail: unset exit node: %v", err)
 			}
 			a.requestRefresh()
 		}),
-		mkRadio("Auto (best)", auto, func() {
-			if err := SetExitNode(context.Background(), "auto:any"); err != nil {
-				log.Printf("traytail: set auto exit node: %v", err)
-			}
+		mkRadio("Auto (smart: away→own, home→Mullvad)", auto, func() {
+			a.enableSmartAuto()
 			a.requestRefresh()
 		}),
 	}
@@ -355,6 +483,7 @@ func ownExitItem(n ExitNodeInfo, active bool, a *app) MenuItem {
 		label = label[:i] // strip domain: zds-nabara.tail... -> zds-nabara
 	}
 	return mkRadio(label, active, func() {
+		a.disableSmartAuto()
 		if err := SetExitNode(context.Background(), n.Hostname); err != nil {
 			log.Printf("traytail: set exit node: %v", err)
 		}
@@ -400,6 +529,7 @@ func cityItems(nodes []ExitNodeInfo, activeHost string, a *app) []MenuItem {
 		n := n
 		active := hostMatches(n.Hostname, activeHost)
 		out = append(out, mkRadio(exitNodeLabel(n), active, func() {
+			a.disableSmartAuto()
 			if err := SetExitNode(context.Background(), n.Hostname); err != nil {
 				log.Printf("traytail: set exit node: %v", err)
 			}

@@ -45,8 +45,8 @@ Profile: zaolin@github ▸        (if >1 account; parent shows active)
   ● zaolin@github               (active: click does nothing)
   ○ philipp@binarly.io          (click = switch, refreshes menu)
 Exit node: Berlin ▸             (parent shows full city of the active node)
-  ● Off                         (explicit off switch; active when no exit node)
-  ○ Auto (best)                 (tailscale auto:any)
+  ● Auto (smart: away→own, home→Mullvad)
+  ○ Off
   ──
   ○ zds-nabara                  (own nodes, first DNS label)
   ──
@@ -67,6 +67,15 @@ list, and every item carries a `●`/`○` radio marker — including an
 explicit `Off` entry, so there is no click-active-to-disable trick.
 State is shown as a text glyph instead of checkmark properties because
 SNI hosts like ashell render `toggle-type: checkmark` items as switches.
+
+**Smart auto** replaces tailscale's native `auto:any` with a policy
+traytail manages itself: when your machine is *away* (no local
+interface address inside the LAN routes advertised by your own exit
+node) it routes through the own exit node; when *at home* it switches
+to the last-used Mullvad node (persisted across restarts). The policy
+re-applies only when the home/away state flips — manual selections and
+Off stay untouched while the state is stable, and any manual pick or
+Off disables smart auto.
 
 ## Notes
 

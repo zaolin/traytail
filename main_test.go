@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
+	"net/netip"
 	"os/exec"
 	"sync"
 	"testing"
@@ -90,6 +92,26 @@ func restoreExec(t *testing.T) *execRecorder {
 	}
 	t.Cleanup(func() { execCommand = orig })
 	return rec
+}
+
+// restoreIfaceAddrs replaces the interfaceAddrs seam with a fixed
+// address list (parsed from CIDR strings); nil restores "no addrs".
+func restoreIfaceAddrs(t *testing.T, cidrs []string) {
+	t.Helper()
+	orig := interfaceAddrs
+	interfaceAddrs = func() ([]net.Addr, error) {
+		var out []net.Addr
+		for _, c := range cidrs {
+			ipp, err := netip.ParsePrefix(c)
+			if err != nil {
+				t.Fatalf("bad cidr %q: %v", c, err)
+			}
+			ipnet := net.CIDRMask(ipp.Bits(), ipp.Addr().BitLen())
+			out = append(out, &net.IPNet{IP: net.IP(ipp.Addr().AsSlice()), Mask: ipnet})
+		}
+		return out, nil
+	}
+	t.Cleanup(func() { interfaceAddrs = orig })
 }
 
 func restoreExecFailing(t *testing.T) *execRecorder {
@@ -488,6 +510,8 @@ func TestSplitMullvad(t *testing.T) {
 	}
 }
 
+const smartAutoLabel = "Auto (smart: away→own, home→Mullvad)"
+
 func TestExitNodeMenuOffAndAuto(t *testing.T) {
 	ft := installFakeTailscale(t)
 	ft.setExitNodeList(t, exitNodeListFixture)
@@ -499,7 +523,7 @@ func TestExitNodeMenuOffAndAuto(t *testing.T) {
 	if off == nil {
 		t.Fatalf("Off missing: %v", labels(items))
 	}
-	if !hasLabel(items, "○ Auto (best)") {
+	if !hasLabel(items, "○ "+smartAutoLabel) {
 		t.Errorf("Auto missing: %v", labels(items))
 	}
 }
@@ -546,23 +570,11 @@ func TestAutoExitNodeActive(t *testing.T) {
 	}
 }
 
-func TestExitSuffixAutoMode(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
-	ft.setDebugPrefs(t, `{"AutoExitNode":"any"}`)
-	st := &Status{BackendState: "Running"}
-	// exit peer is the auto-resolved node; must NOT show its city
-	got := exitSuffix(&Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNode: true}, st)
-	if got != ": Auto (best)" {
-		t.Errorf("auto mode suffix = %q, want ': Auto (best)'", got)
-	}
-}
-
 func TestExitNodeMenuAutoMode(t *testing.T) {
 	ft := installFakeTailscale(t)
 	ft.setExitNodeList(t, exitNodeListFixture)
-	ft.setDebugPrefs(t, `{"AutoExitNode":"any"}`)
 	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true, atHome: true}
 	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
 	st := &Status{
 		BackendState: "Running",
@@ -570,59 +582,69 @@ func TestExitNodeMenuAutoMode(t *testing.T) {
 	}
 	items := a.exitNodeMenu(st, &active)
 
-	if !hasLabel(items, "● Auto (best)") {
-		t.Errorf("Auto should be active in auto mode: %v", labels(items))
+	if !hasLabel(items, "● "+smartAutoLabel) {
+		t.Errorf("Auto should be active in smart-auto mode: %v", labels(items))
 	}
 	if !hasLabel(items, "○ Off") {
 		t.Errorf("Off should be inactive: %v", labels(items))
 	}
-	// resolved node must NOT be marked and country NOT hoisted
+	// smart-auto applied the node itself: city IS marked and country hoisted
 	mullvad := findLabel(items, "Mullvad")
 	if mullvad == nil {
 		t.Fatal("Mullvad submenu missing")
 	}
-	if hasLabel(mullvad.Submenu, "● Germany") {
-		t.Errorf("country should not be hoisted in auto mode: %v", labels(mullvad.Submenu))
+	if !hasLabel(mullvad.Submenu, "● Germany") {
+		t.Errorf("country should be hoisted in smart-auto mode: %v", labels(mullvad.Submenu))
 	}
-	if hasLabel(mullvad.Submenu, "● Berlin") {
-		t.Errorf("resolved city should not be marked in auto mode: %v", labels(mullvad.Submenu))
-	}
-	if !hasLabel(mullvad.Submenu, "Germany") {
-		t.Errorf("Germany should still be listed: %v", labels(mullvad.Submenu))
+	if !hasLabel(mullvad.Submenu, "● Berlin") {
+		t.Errorf("applied city should be marked in smart-auto mode: %v", labels(mullvad.Submenu))
 	}
 }
 
 func TestExitNodeMenuAutoParentLabel(t *testing.T) {
 	ft := installFakeTailscale(t)
 	ft.setExitNodeList(t, exitNodeListFixture)
-	ft.setDebugPrefs(t, `{"AutoExitNode":"any"}`)
 	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true, atHome: true}
 	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": active}}
 	_, _, menu := a.buildUI(st, nil)
-	if !hasLabel(menu, "Exit node: Auto (best)") {
-		t.Errorf("parent label in auto mode: %v", labels(menu))
+	// parent shows the applied node's city, not "auto"
+	if !hasLabel(menu, "Exit node: Berlin") {
+		t.Errorf("parent label in smart-auto mode: %v", labels(menu))
 	}
 }
 
-func TestExitNodeMenuAutoClick(t *testing.T) {
+func TestExitNodeMenuAutoClickEnables(t *testing.T) {
 	ft := installFakeTailscale(t)
 	ft.setExitNodeList(t, exitNodeListFixture)
+	// no local IPs in the advertised LANs -> "away" -> should pick own node
+	restoreIfaceAddrs(t, nil)
+	// status resp must include the own node so enableSmartAuto finds it
+	ft.setResponse(t, `{"BackendState":"Running","Peer":{"own":{"HostName":"zds-nabara","DNSName":"zds-nabara.tailb4e47d.ts.net.","ExitNodeOption":true,"Online":true,"PrimaryRoutes":["192.168.178.0/24"]}}}`)
 	a := newTestApp(t, &fakeUI{})
-	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
+	a.smart = &smartAuto{}
+	own := Peer{HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, PrimaryRoutes: []string{"192.168.178.0/24"}}
+	st := &Status{
+		BackendState: "Running",
+		Peer:         map[string]Peer{"own": own},
+	}
 	items := a.exitNodeMenu(st, nil)
 
-	auto := findLabel(items, "○ Auto (best)")
+	auto := findLabel(items, "○ "+smartAutoLabel)
 	if auto == nil {
-		t.Fatal("Auto missing")
+		t.Fatalf("Auto missing: %v", labels(items))
 	}
 	auto.OnClick()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=auto:any" {
-		t.Errorf("auto ran %v", got)
+	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=zds-nabara" {
+		t.Errorf("smart auto enable ran %v, want own node (away)", got)
+	}
+	if !a.smartPrimed() {
+		t.Error("smart auto should be primed after enabling")
 	}
 }
 
@@ -754,12 +776,288 @@ func TestExitNodeMenuNoNodesPlaceholder(t *testing.T) {
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
 	items := a.exitNodeMenu(st, nil)
-	if !hasLabel(items, "● Off") || !hasLabel(items, "○ Auto (best)") {
+	if !hasLabel(items, "● Off") || !hasLabel(items, "○ "+smartAutoLabel) {
 		t.Fatalf("Off/Auto should always be present: %v", labels(items))
 	}
 	if hasLabel(items, "Mullvad") {
 		t.Errorf("Mullvad submenu without any nodes: %v", labels(items))
 	}
+}
+
+// ---- smart-auto state machine ----
+
+func smartTestStatus() *Status {
+	return &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"own": {HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, PrimaryRoutes: []string{"192.168.178.0/24"}},
+			"mv":  {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+		},
+	}
+}
+
+func TestTickSmartAutoPrimeOnly(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	restoreIfaceAddrs(t, nil) // away
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	a.tickSmartAuto(smartTestStatus()) // prime
+	if a.smart.primed != true || a.smart.atHome != false {
+		t.Fatalf("prime state wrong: %+v", a.smart)
+	}
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			t.Fatalf("priming must not apply anything, ran %v", c)
+		}
+	}
+}
+
+func TestTickSmartAutoFlipsAwayToHome(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	// prime: away
+	restoreIfaceAddrs(t, nil)
+	a.tickSmartAuto(smartTestStatus())
+
+	// flip: home (local IP inside advertised LAN)
+	restoreIfaceAddrs(t, []string{"192.168.178.35/24"})
+	a.tickSmartAuto(smartTestStatus())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil {
+		t.Fatalf("flip should apply a node, calls: %v", ft.callsSoFar(t))
+	}
+	// home -> Mullvad: last-used empty, no "selected" row online in fixture
+	// (fixture's selected row is Germany, not in st peers) -> first online peer: al-tia-wg-001
+	if setCall[1] != "--exit-node=al-tia-wg-001" {
+		t.Errorf("home flip applied %v, want last/first Mullvad", setCall)
+	}
+}
+
+func TestTickSmartAutoFlipsHomeToAway(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	// prime: home
+	restoreIfaceAddrs(t, []string{"192.168.178.35/24"})
+	a.tickSmartAuto(smartTestStatus())
+
+	// flip: away
+	restoreIfaceAddrs(t, nil)
+	a.tickSmartAuto(smartTestStatus())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil {
+		t.Fatalf("flip should apply own node, calls: %v", ft.callsSoFar(t))
+	}
+	if setCall[1] != "--exit-node=zds-nabara" {
+		t.Errorf("away flip applied %v, want own node", setCall)
+	}
+}
+
+func TestTickSmartAutoStableDoesNotThrash(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	restoreIfaceAddrs(t, nil) // away, stays away
+	a.tickSmartAuto(smartTestStatus())
+	nAfterPrime := len(ft.callsSoFar(t))
+	for i := 0; i < 5; i++ {
+		a.tickSmartAuto(smartTestStatus())
+	}
+	if got := len(ft.callsSoFar(t)); got != nAfterPrime {
+		t.Errorf("stable state applied %d extra calls", got-nAfterPrime)
+	}
+}
+
+func TestTickSmartAutoPersistsLastMullvad(t *testing.T) {
+	// Point the state file into a temp dir.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	// prime: away (prime-only), then flip home -> applies first online
+	// Mullvad (al-tia-wg-001) and stores it
+	restoreIfaceAddrs(t, nil)
+	a.tickSmartAuto(smartTestStatus())
+	restoreIfaceAddrs(t, []string{"192.168.178.35/24"})
+	a.tickSmartAuto(smartTestStatus())
+
+	if got := LoadLastMullvad(); got != "al-tia-wg-001" {
+		t.Errorf("stored last-mullvad = %q, want al-tia-wg-001", got)
+	}
+
+	// Simulate restart: fresh state machine; last-used wins over "first".
+	a2 := newTestApp(t, &fakeUI{})
+	a2.smart = &smartAuto{}
+	if got := LoadLastMullvad(); got == "" {
+		t.Fatal("state file missing after store")
+	}
+	// add a second online mullvad peer; last-used should still win
+	st := smartTestStatus()
+	st.Peer["mv2"] = Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}}
+	// flip to away and back home to force a fresh pick
+	restoreIfaceAddrs(t, nil)
+	a2.tickSmartAuto(st)
+	restoreIfaceAddrs(t, []string{"192.168.178.35/24"})
+	a2.tickSmartAuto(st)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil || setCall[1] != "--exit-node=al-tia-wg-001" {
+		t.Errorf("last-used should win over first peer, ran %v", setCall)
+	}
+}
+
+func TestPickMullvadNode(t *testing.T) {
+	st := &Status{Peer: map[string]Peer{
+		"a": {HostName: "nl-ams-wg-001", DNSName: "nl-ams-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+		"b": {HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+		"o": {HostName: "own", ExitNodeOption: true, Online: true},
+	}}
+	nodes := []ExitNodeInfo{
+		{Hostname: "nl-ams-wg-001.mullvad.ts.net", Country: "Netherlands", City: "Amsterdam"},
+		{Hostname: "de-ber-wg-001.mullvad.ts.net", Country: "Germany", City: "Berlin", Selected: true},
+	}
+
+	// last-used still online wins
+	if got := PickMullvadNode(st, nodes, "de-ber-wg-001"); got != "de-ber-wg-001" {
+		t.Errorf("last-used = %q", got)
+	}
+	// empty last-used -> selected row
+	if got := PickMullvadNode(st, nodes, ""); got != "de-ber-wg-001" {
+		t.Errorf("selected row = %q", got)
+	}
+	// last-used offline -> selected row
+	if got := PickMullvadNode(st, nodes, "us-nyc-wg-999"); got != "de-ber-wg-001" {
+		t.Errorf("offline last-used fallback = %q", got)
+	}
+	// nothing online -> ""
+	empty := &Status{Peer: map[string]Peer{}}
+	if got := PickMullvadNode(empty, nodes, ""); got != "" {
+		t.Errorf("no online nodes = %q", got)
+	}
+}
+
+func TestOwnExitNodeLANsAndAtHome(t *testing.T) {
+	st := &Status{Peer: map[string]Peer{
+		"own":    {HostName: "own", ExitNodeOption: true, Online: true, PrimaryRoutes: []string{"192.168.178.0/24"}},
+		"mull":   {HostName: "de-ber-wg-001", Tags: []string{"tag:mullvad-exit-node"}, ExitNodeOption: true, Online: true, PrimaryRoutes: []string{"10.0.0.0/24"}},
+		"offown": {HostName: "own2", ExitNodeOption: true, Online: false, PrimaryRoutes: []string{"172.16.0.0/12"}},
+	}}
+	lans := OwnExitNodeLANs(st)
+	if len(lans) != 1 || lans[0].String() != "192.168.178.0/24" {
+		t.Fatalf("lans = %v, want only own online node's LAN", lans)
+	}
+
+	// at home when local addr inside
+	restoreIfaceAddrs(t, []string{"192.168.178.42/24"})
+	if !AtHome(lans) {
+		t.Error("should be at home")
+	}
+	// away otherwise
+	restoreIfaceAddrs(t, []string{"10.9.9.9/24"})
+	if AtHome(lans) {
+		t.Error("should be away")
+	}
+	// no prefixes -> never home
+	if AtHome(nil) {
+		t.Error("no prefixes should not be home")
+	}
+}
+
+func TestDisableSmartAutoOnManualPick(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	st := &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"mv-a": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+		},
+	}
+	items := a.exitNodeMenu(st, nil)
+
+	city := findLabel(mullvadSub(items), "○ Tirana")
+	if city == nil {
+		t.Fatalf("Tirana missing: %v", labels(mullvadSub(items)))
+	}
+	city.OnClick()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a.smart != nil {
+		t.Error("manual pick should disable smart auto")
+	}
+	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=al-tia-wg-001.mullvad.ts.net" {
+		t.Errorf("manual pick ran %v", got)
+	}
+}
+
+func TestDisableSmartAutoOnOffClick(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
+	items := a.exitNodeMenu(st, nil)
+
+	off := findLabel(items, "● Off")
+	off.OnClick()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if a.smart != nil {
+		t.Error("Off click should disable smart auto")
+	}
+}
+
+// mullvadSub finds the Mullvad submenu in the exit-node items.
+func mullvadSub(items []MenuItem) []MenuItem {
+	if m := findLabel(items, "Mullvad"); m != nil {
+		return m.Submenu
+	}
+	return nil
 }
 
 // ---- menuOffline / menuNeedsLogin ----
