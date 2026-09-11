@@ -5,7 +5,8 @@
 
 A minimal Tailscale tray icon for Wayland bars that host the
 [StatusNotifierItem](https://www.freedesktop.org/wiki/Specifications/status-notifier-item/)
-protocol — built and tested against [ashell](https://github.com/MalpenZibo/ashell).
+protocol — built and tested against [ashell](https://github.com/MalpenZibo/ashell)
+(see [ashell](#ashell) for configuration notes).
 
 No GUI toolkit. Pure Go, one dependency (`github.com/godbus/dbus/v5`), ~900 lines.
 
@@ -87,6 +88,27 @@ on. Active nodes are matched by Tailscale IP, so a user-renamed device
 - Exit node selection uses `tailscale set --exit-node=<hostname>`;
   labels and grouping come from `tailscale exit-node list`.
 - Works with any SNI host (ashell, waybar, KDE Plasma), not just ashell.
+
+## ashell
+
+traytail is developed against [ashell](https://github.com/MalpenZibo/ashell)'s
+tray module and works out of the box with its defaults — the module only
+appears once a tray icon exists, so no configuration is needed. Notes for
+ashell setups:
+
+- **Menu opens on left click** by default (ashell's `right_click` is unset
+  → left click opens the context menu). If you set `right_click = "Menu"`,
+  left click switches to activating the app instead — traytail has no
+  window, so keep the default or use `right_click = "Open"`.
+- **ashell renders checkmark items as switches**, which is why traytail
+  carries all selection state as `●`/`○` text glyphs on plain items —
+  every menu entry renders as a normal button and closes the menu on click.
+- Submenus render inline with `▸` toggles; the exit-node menu nests
+  `Mullvad ▸ country ▸ city`, which ashell displays fine (indentation per level).
+- traytail registers under the name `traytail`; add it to ashell's
+  `[tray] blocklist` only if you *don't* want it shown.
+- Other SNI hosts (waybar with SNI support, KDE Plasma) should work too,
+  but are untested — ashell is the reference host.
 
 ## Development
 
