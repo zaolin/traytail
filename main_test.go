@@ -178,9 +178,8 @@ func TestBuildUINeedsLoginNoURL(t *testing.T) {
 }
 
 func TestBuildUIExitNodeActive(t *testing.T) {
+	installFakeTailscale(t) // no exit-node list -> hostname-based fallback
 	a := newTestApp(t, &fakeUI{})
-	// The peer is not tagged mullvad here, so the suffix shows the raw
-	// hostname; use a tagged peer for the city label variant.
 	st := &Status{
 		BackendState: "Running",
 		TailscaleIPs: []string{"100.64.0.1"},
@@ -191,9 +190,6 @@ func TestBuildUIExitNodeActive(t *testing.T) {
 	icon, tooltip, items := a.buildUI(st, nil)
 	if !hasLabel(items, "Exit node: fra") {
 		t.Errorf("submenu parent should show city: %v", labels(items))
-	}
-	if !hasLabel(items, "Exit node: de-fra-wg-001") == false && !hasLabel(items, "Exit node: fra") {
-		t.Errorf("expected either form: %v", labels(items))
 	}
 	// exit-node icon is the green-ring pixmap: pixel(16,1) is green
 	if px := pixelAt(t, icon, 16, 1); px != [4]byte{255, 90, 200, 100} {
@@ -295,18 +291,21 @@ func TestMenuOnlineInfoRowAndAdmin(t *testing.T) {
 
 func TestMenuOnlineCopyIP(t *testing.T) {
 	rec := restoreExec(t)
+	// exit-node list is not installed here, so `menuOnline` construction
+	// skips the CLI; nothing else should call it either.
 	ft := installFakeTailscale(t)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running", TailscaleIPs: []string{"100.64.0.2"}}
 	items := a.menuOnline(st, nil, nil)
+	nBaseline := len(ft.callsSoFar(t))
 
 	copyItem := findLabel(items, "Copy IP: 100.64.0.2")
 	if copyItem == nil {
 		t.Fatal("Copy IP item missing")
 	}
 	copyItem.OnClick()
-	if got := ft.callsSoFar(t); len(got) != 0 {
-		t.Errorf("copy should not call CLI, got %v", got)
+	if got := len(ft.callsSoFar(t)) - nBaseline; got != 0 {
+		t.Errorf("copy should not call CLI, %d extra calls", got)
 	}
 	if len(rec.all()) != 1 {
 		t.Errorf("copy click recorded %d exec calls", len(rec.all()))
@@ -352,12 +351,12 @@ func TestMenuOnlineProfiles(t *testing.T) {
 	if profileSub == nil {
 		t.Fatalf("Profile submenu missing: %v", labels(items))
 	}
-	active := findLabel(items, "one@x")
-	if active == nil || active.Checked != true || active.OnClick != nil {
-		t.Errorf("active profile should be checked with nil handler")
+	active := findLabel(items, "● one@x")
+	if active == nil || active.OnClick != nil {
+		t.Errorf("active profile should be a radio item with nil handler: %v", labels(items))
 	}
-	other := findLabel(items, "two@y")
-	if other == nil || other.Checked != false || other.OnClick == nil {
+	other := findLabel(items, "○ two@y")
+	if other == nil || other.OnClick == nil {
 		t.Fatal("inactive profile missing click handler")
 	}
 	other.OnClick()
@@ -389,28 +388,92 @@ func TestMenuOnlineNoProfilesSubmenuWhenSingle(t *testing.T) {
 // ---- exit node menu ----
 
 func TestExitSuffix(t *testing.T) {
-	if got := exitSuffix(nil); got != ": off" {
+	installFakeTailscale(t) // block resolution of the real CLI
+	st := &Status{BackendState: "Running"}
+	if got := exitSuffix(nil, st); got != ": off" {
 		t.Errorf("nil exit = %q", got)
 	}
-	if got := exitSuffix(&Peer{HostName: "homeserver"}); got != ": homeserver" {
+	// exit-node list unavailable (no fake installed): hostname fallback
+	if got := exitSuffix(&Peer{HostName: "homeserver"}, st); got != ": homeserver" {
 		t.Errorf("own node = %q", got)
 	}
-	if got := exitSuffix(&Peer{HostName: "de-fra-wg-001", Tags: []string{"tag:mullvad-exit-node-de"}}); got != ": fra" {
+	if got := exitSuffix(&Peer{HostName: "de-fra-wg-001", Tags: []string{"tag:mullvad-exit-node-de"}}, st); got != ": fra" {
 		t.Errorf("mullvad = %q", got)
 	}
 	// tagged mullvad but hostname lacks a city segment: SplitN still
 	// yields two parts ("mullvad", "only"), so the label is that second
 	// token, not the hostname.
-	if got := exitSuffix(&Peer{HostName: "mullvad-only", Tags: []string{"tag:mullvad"}}); got != ": only" {
+	if got := exitSuffix(&Peer{HostName: "mullvad-only", Tags: []string{"tag:mullvad"}}, st); got != ": only" {
 		t.Errorf("mullvad without city = %q", got)
 	}
 	// a hostname without dashes at all falls back to the full hostname
-	if got := exitSuffix(&Peer{HostName: "mullvadsolo", Tags: []string{"tag:mullvad"}}); got != ": mullvadsolo" {
+	if got := exitSuffix(&Peer{HostName: "mullvadsolo", Tags: []string{"tag:mullvad"}}, st); got != ": mullvadsolo" {
 		t.Errorf("mullvad single-token host = %q", got)
 	}
 	// DNS-name-based detection (no tags) also yields the city
-	if got := exitSuffix(&Peer{HostName: "nl-ams-wg-003", DNSName: "nl-ams-wg-003.mullvad.ts.net."}); got != ": ams" {
+	if got := exitSuffix(&Peer{HostName: "nl-ams-wg-003", DNSName: "nl-ams-wg-003.mullvad.ts.net."}, st); got != ": ams" {
 		t.Errorf("mullvad via DNS = %q", got)
+	}
+}
+
+func TestExitSuffixPrefersExitNodeList(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	st := &Status{BackendState: "Running"}
+	got := exitSuffix(&Peer{HostName: "de-ber-wg-001.mullvad.ts.net."}, st)
+	if got != ": Berlin" {
+		t.Errorf("exitSuffix with list = %q, want ': Berlin'", got)
+	}
+}
+
+// exitNodeListFixture mirrors `tailscale exit-node list` output:
+// multi-word cities, own node with "-" fields, "Any" duplicate, selected row.
+const exitNodeListFixture = `
+ IP                  HOSTNAME                         COUNTRY            CITY                   STATUS       
+ 100.107.25.96       zds-nabara.tailb4e47d.ts.net     -                  -                      -            
+ 100.77.189.15       al-tia-wg-001.mullvad.ts.net     Albania            Tirana                 -            
+ 100.65.216.13       au-adl-wg-301.mullvad.ts.net     Australia          Any                    -            
+ 100.65.216.13       au-adl-wg-301.mullvad.ts.net     Australia          Adelaide               -            
+ 100.123.112.108     de-ber-wg-001.mullvad.ts.net     Germany            Berlin                 selected     
+`
+
+func TestGetExitNodes(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+
+	nodes, err := GetExitNodes(context.Background())
+	if err != nil {
+		t.Fatalf("GetExitNodes: %v", err)
+	}
+	if len(nodes) != 5 {
+		t.Fatalf("nodes = %d, want 5 (Any dupe kept for dedupe at menu level)", len(nodes))
+	}
+	own := nodes[0]
+	if own.Country != "" || own.City != "" || own.Selected {
+		t.Errorf("own node parsed wrong: %+v", own)
+	}
+	ber := nodes[4]
+	if !ber.Selected || ber.Country != "Germany" || ber.City != "Berlin" {
+		t.Errorf("selected row parsed wrong: %+v", ber)
+	}
+	if nodes[1].City != "Tirana" {
+		t.Errorf("multi-word/regular city: %+v", nodes[1])
+	}
+}
+
+func TestGetExitNodesError(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setFail(t)
+	if _, err := GetExitNodes(context.Background()); err == nil {
+		t.Fatal("should fail when CLI fails")
+	}
+}
+
+func TestGetExitNodesGarbage(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, "some error occurred")
+	if _, err := GetExitNodes(context.Background()); err == nil {
+		t.Fatal("should fail with no parseable rows")
 	}
 }
 
@@ -425,115 +488,60 @@ func TestSplitMullvad(t *testing.T) {
 	}
 }
 
-func TestExitNodeMenuEmpty(t *testing.T) {
+func TestExitNodeMenuOffAndAuto(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
-	items := a.exitNodeMenu(st)
-	if !hasLabel(items, "Auto (best)") {
-		t.Fatalf("Auto missing: %v", labels(items))
+	items := a.exitNodeMenu(st, nil)
+
+	off := findLabel(items, "● Off")
+	if off == nil {
+		t.Fatalf("Off missing: %v", labels(items))
 	}
-	if !hasLabel(items, "No exit nodes available") {
-		t.Errorf("empty state placeholder missing: %v", labels(items))
+	if !hasLabel(items, "○ Auto (best)") {
+		t.Errorf("Auto missing: %v", labels(items))
 	}
 }
 
-func TestExitNodeMenuOwnAndMullvad(t *testing.T) {
-	a := newTestApp(t, &fakeUI{})
-	st := &Status{
-		BackendState: "Running",
-		Peer: map[string]Peer{
-			"own":  {HostName: "homeserver", ExitNodeOption: true, Online: true},
-			"mv-a": {HostName: "nl-ams-wg-002", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node-nl"}},
-			"mv-b": {HostName: "de-fra-wg-001", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node-de"}},
-			"off":  {HostName: "offline-node", ExitNodeOption: true, Online: false},
-			"noex": {HostName: "plain", Online: true},
-		},
-	}
-	items := a.exitNodeMenu(st)
-
-	auto := findLabel(items, "Auto (best)")
-	if auto == nil || !auto.Checked {
-		t.Fatalf("Auto should be checked when no exit selected")
-	}
-	if !hasLabel(items, "homeserver") {
-		t.Errorf("own node missing: %v", labels(items))
-	}
-	if !hasLabel(items, "NL") || !hasLabel(items, "DE") {
-		t.Errorf("country submenus missing: %v", labels(items))
-	}
-	if hasLabel(items, "offline-node") || hasLabel(items, "plain") {
-		t.Errorf("offline / non-exit peers leaked into menu: %v", labels(items))
-	}
-}
-
-func TestExitNodeMenuActivePeerChecked(t *testing.T) {
-	a := newTestApp(t, &fakeUI{})
-	active := Peer{HostName: "homeserver", DNSName: "homeserver.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
-	st := &Status{
-		BackendState: "Running",
-		Peer:         map[string]Peer{"own": active},
-	}
-	items := a.exitNodeMenu(st)
-	activeItem := findLabel(items, "homeserver")
-	if activeItem == nil || !activeItem.Checked {
-		t.Fatal("active peer should be checked")
-	}
-	if !hasLabel(items, "Exit node: homeserver") {
-		// this is the submenu parent; verify via full build
-		_, _, menu := a.buildUI(st, nil)
-		if !hasLabel(menu, "Exit node: homeserver") {
-			t.Errorf("parent label missing: %v", labels(menu))
-		}
-	}
-}
-
-func TestExitNodeToggleUnsetActive(t *testing.T) {
+func TestExitNodeMenuOffClick(t *testing.T) {
 	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
-	item := a.exitNodeToggle(Peer{HostName: "homeserver", DNSName: "homeserver.ts.net."}, true)
-	if !item.Checked {
-		t.Fatal("active toggle should be checked")
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
+	items := a.exitNodeMenu(st, nil)
+
+	off := findLabel(items, "● Off")
+	if off == nil {
+		t.Fatalf("Off missing: %v", labels(items))
 	}
-	item.OnClick()
+	off.OnClick()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=" {
-		t.Errorf("unset ran %v", got)
+		t.Errorf("off ran %v", got)
 	}
 	select {
 	case <-a.refreshCh:
 	case <-time.After(time.Second):
-		t.Error("toggle should request refresh")
+		t.Error("Off click should request refresh")
 	}
 }
 
-func TestExitNodeToggleSetInactive(t *testing.T) {
+func TestExitNodeMenuAutoClick(t *testing.T) {
 	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
-	item := a.exitNodeToggle(Peer{HostName: "homeserver", DNSName: "homeserver.ts.net."}, false)
-	if item.Checked {
-		t.Fatal("inactive toggle should be unchecked")
-	}
-	item.OnClick()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=homeserver.ts.net" {
-		t.Errorf("set ran %v (want base name)", got)
-	}
-}
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
+	items := a.exitNodeMenu(st, nil)
 
-func TestAutoToggleOffSelectsAuto(t *testing.T) {
-	ft := installFakeTailscale(t)
-	a := newTestApp(t, &fakeUI{})
-	item := a.autoToggle(&Peer{HostName: "homeserver"})
-	if item.Checked {
-		t.Fatal("auto should be unchecked while a peer is active")
+	auto := findLabel(items, "○ Auto (best)")
+	if auto == nil {
+		t.Fatal("Auto missing")
 	}
-	item.OnClick()
+	auto.OnClick()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
@@ -543,20 +551,139 @@ func TestAutoToggleOffSelectsAuto(t *testing.T) {
 	}
 }
 
-func TestAutoToggleOnUnsets(t *testing.T) {
+func TestExitNodeMenuOwnAndMullvad(t *testing.T) {
 	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
-	item := a.autoToggle(nil)
-	if !item.Checked {
-		t.Fatal("auto should be checked with no peer selected")
+	st := &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"own":  {HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true},
+			"mv-a": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+			"mv-b": {HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+			"off":  {HostName: "offline-node", ExitNodeOption: true, Online: false},
+			"noex": {HostName: "plain", Online: true},
+		},
 	}
-	item.OnClick()
+	items := a.exitNodeMenu(st, nil)
+
+	if !hasLabel(items, "○ zds-nabara") {
+		t.Errorf("own node missing: %v", labels(items))
+	}
+	if !hasLabel(items, "Mullvad") {
+		t.Fatalf("Mullvad submenu missing: %v", labels(items))
+	}
+	mullvad := findLabel(items, "Mullvad")
+	if !hasLabel(mullvad.Submenu, "Albania") || !hasLabel(mullvad.Submenu, "Germany") {
+		t.Errorf("full country names missing: %v", labels(mullvad.Submenu))
+	}
+	if hasLabel(items, "offline-node") || hasLabel(items, "plain") {
+		t.Errorf("offline / non-exit peers leaked into menu: %v", labels(items))
+	}
+	// Australia "Any" duplicate suppressed: only Adelaide survives
+	germany := findLabel(mullvad.Submenu, "Germany")
+	if germany == nil {
+		t.Fatal("Germany submenu missing")
+	}
+}
+
+func TestExitNodeMenuActiveCountryHoisted(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	st := &Status{
+		BackendState: "Running",
+		Peer:         map[string]Peer{"mv": active},
+	}
+	items := a.exitNodeMenu(st, &active)
+
+	mullvad := findLabel(items, "Mullvad")
+	if mullvad == nil {
+		t.Fatal("Mullvad submenu missing")
+	}
+	first := mullvad.Submenu[0]
+	if first.Label != "● Germany" {
+		t.Errorf("active country should be hoisted with ●, got %q (all: %v)", first.Label, labels(mullvad.Submenu))
+	}
+	berlin := findLabel(mullvad.Submenu, "● Berlin")
+	if berlin == nil {
+		t.Errorf("active city should carry ● marker: %v", labels(mullvad.Submenu))
+	}
+}
+
+func TestExitNodeMenuParentLabelCity(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNode: true}
+	st := &Status{
+		BackendState: "Running",
+		Peer:         map[string]Peer{"mv": active},
+	}
+	_, _, menu := a.buildUI(st, nil)
+	if !hasLabel(menu, "Exit node: Berlin") {
+		t.Errorf("parent should show full city: %v", labels(menu))
+	}
+}
+
+func TestExitNodeMenuOwnActiveChecked(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	active := Peer{HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{"own": active}}
+	items := a.exitNodeMenu(st, &active)
+	if !hasLabel(items, "● zds-nabara") {
+		t.Errorf("active own node should have ● marker: %v", labels(items))
+	}
+}
+
+func TestExitNodeMenuCityClickSetsExitNode(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"mv-a": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+		},
+	}
+	items := a.exitNodeMenu(st, nil)
+
+	mullvad := findLabel(items, "Mullvad")
+	if mullvad == nil {
+		t.Fatalf("Mullvad submenu missing: %v", labels(items))
+	}
+	albania := findLabel(mullvad.Submenu, "Albania")
+	if albania == nil {
+		t.Fatalf("Albania missing: %v", labels(mullvad.Submenu))
+	}
+	tirana := findLabel(albania.Submenu, "○ Tirana")
+	if tirana == nil {
+		t.Fatalf("Tirana item missing: %v", labels(albania.Submenu))
+	}
+	tirana.OnClick()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=" {
-		t.Errorf("unset ran %v", got)
+	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=al-tia-wg-001.mullvad.ts.net" {
+		t.Errorf("city click ran %v", got)
+	}
+}
+
+func TestExitNodeMenuNoNodesPlaceholder(t *testing.T) {
+	installFakeTailscale(t)
+	// no exit-node list response: GetExitNodes returns nothing parseable
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
+	items := a.exitNodeMenu(st, nil)
+	if !hasLabel(items, "● Off") || !hasLabel(items, "○ Auto (best)") {
+		t.Fatalf("Off/Auto should always be present: %v", labels(items))
+	}
+	if hasLabel(items, "Mullvad") {
+		t.Errorf("Mullvad submenu without any nodes: %v", labels(items))
 	}
 }
 

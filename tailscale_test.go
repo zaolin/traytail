@@ -15,6 +15,8 @@ type fakeTailscale struct {
 	dir     string
 	logPath string
 
+	exitNodeList string
+
 	mu     sync.Mutex
 	calls  [][]string
 	stdout map[string]string // keyed by args joined with spaces
@@ -65,6 +67,26 @@ func (ft *fakeTailscale) callsSoFar(t *testing.T) [][]string {
 func (ft *fakeTailscale) setFail(t *testing.T) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(ft.dir, "fail"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setExitNodeList writes the canned `tailscale exit-node list` table.
+// Subcommand-aware: exit-node list returns this; status/switch still
+// use resp.txt.
+func (ft *fakeTailscale) setExitNodeList(t *testing.T, table string) {
+	t.Helper()
+	ft.exitNodeList = table
+	if err := os.WriteFile(filepath.Join(ft.dir, "exitnodes.txt"), []byte(table), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// rewrite the CLI script to serve the table for exit-node list
+	cli := filepath.Join(ft.dir, "bin", "tailscale")
+	script := "#!/bin/sh\necho \"$@\" >> " + ft.logPath + "\n" +
+		"if [ \"$1\" = \"exit-node\" ]; then cat " + filepath.Join(ft.dir, "exitnodes.txt") + "; exit 0; fi\n" +
+		"if [ -f " + filepath.Join(ft.dir, "fail") + " ]; then echo 'simulated cli failure' >&2; exit 1; fi\n" +
+		"cat " + filepath.Join(ft.dir, "resp.txt") + " 2>/dev/null || true\n"
+	if err := os.WriteFile(cli, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 }

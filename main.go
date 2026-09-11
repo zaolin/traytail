@@ -144,8 +144,18 @@ func mk(label string, onClick func()) MenuItem {
 	return MenuItem{ID: newID(), Label: label, Enabled: true, OnClick: onClick}
 }
 
-func mkCheck(label string, checked bool, onClick func()) MenuItem {
-	return MenuItem{ID: newID(), Label: label, Enabled: true, Toggle: "checkmark", Checked: checked, OnClick: onClick}
+// radioGlyph prefixes a menu item with an active/inactive marker.
+// ashell renders checkmark items as switches, so state is carried in
+// the label instead ("● active" / "○ inactive").
+func radioGlyph(active bool) string {
+	if active {
+		return "● "
+	}
+	return "○ "
+}
+
+func mkRadio(label string, active bool, onClick func()) MenuItem {
+	return mk(radioGlyph(active)+label, onClick)
 }
 
 func mkSub(label string, children []MenuItem) MenuItem {
@@ -191,9 +201,9 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 		for _, p := range profiles {
 			p := p
 			if p.Selected {
-				profItems = append(profItems, mkCheck(p.Nickname, true, nil))
+				profItems = append(profItems, mkRadio(p.Nickname, true, nil))
 			} else {
-				profItems = append(profItems, mkCheck(p.Nickname, false, func() {
+				profItems = append(profItems, mkRadio(p.Nickname, false, func() {
 					if err := SwitchProfile(context.Background(), p.ID); err != nil {
 						log.Printf("traytail: switch profile: %v", err)
 					}
@@ -205,7 +215,7 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 	}
 
 	// Exit nodes submenu, split into own and Mullvad (per country).
-	items = append(items, mkSub("Exit node"+exitSuffix(exit), a.exitNodeMenu(st)))
+	items = append(items, mkSub("Exit node"+exitSuffix(exit, st), a.exitNodeMenu(st, exit)))
 
 	// Connect / Disconnect
 	items = append(items, mk("Disconnect", func() {
@@ -223,68 +233,99 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 }
 
 // exitSuffix labels the Exit node submenu parent with the current
-// selection, e.g. "Exit node: fra" or "Exit node: off".
-func exitSuffix(exit *Peer) string {
+// selection. Prefers the full city/country from `exit-node list`
+// ("Exit node: Berlin"), falling back to the hostname.
+func exitSuffix(exit *Peer, st *Status) string {
 	if exit == nil {
 		return ": off"
 	}
-	name := exit.HostName
-	if exit.IsMullvad() {
-		if _, city := splitMullvad(name); city != "" {
-			return ": " + city
+	if nodes, err := GetExitNodes(context.Background()); err == nil {
+		for _, n := range nodes {
+			if n.Selected {
+				return ": " + exitNodeLabel(n)
+			}
 		}
 	}
-	return ": " + name
+	return ": " + exitHostName(*exit)
 }
 
-// exitNodeToggle returns a checkmark entry that selects the peer, or
-// deselects it when it is already active (radio behavior: unchecking
-// the sole active node means "no exit node").
-func (a *app) exitNodeToggle(p Peer, active bool) MenuItem {
-	if active {
-		return mkCheck(p.HostName, true, func() {
+// exitNodeLabel picks the friendliest name for an exit node row:
+// city, then hostname-derived code, then hostname.
+func exitNodeLabel(n ExitNodeInfo) string {
+	if n.City != "" {
+		return n.City
+	}
+	return exitHostName(Peer{HostName: n.Hostname})
+}
+
+// exitHostName renders a peer's hostname, stripping Mullvad hostname
+// codes down to the city part when parseable.
+func exitHostName(p Peer) string {
+	name := p.HostName
+	if p.IsMullvad() {
+		if _, city := splitMullvad(name); city != "" {
+			return city
+		}
+	}
+	return name
+}
+
+// exitNodeMenu builds the exit node submenu: Off, Auto (best), own
+// nodes, and Mullvad nodes grouped by country (full names from
+// `tailscale exit-node list`). The active country is hoisted to the
+// top of the Mullvad list so the current selection is easy to find.
+func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
+	nodes, _ := GetExitNodes(context.Background())
+
+	// Determine which hostname is active: from the peer list, resolved
+	// against the exit-node list table for nicer labels.
+	activeHost := ""
+	if exit != nil {
+		activeHost = exit.HostName
+	}
+
+	items := []MenuItem{
+		mkRadio("Off", exit == nil, func() {
 			if err := SetExitNode(context.Background(), ""); err != nil {
 				log.Printf("traytail: unset exit node: %v", err)
 			}
 			a.requestRefresh()
-		})
+		}),
+		mkRadio("Auto (best)", false, func() {
+			if err := SetExitNode(context.Background(), "auto:any"); err != nil {
+				log.Printf("traytail: set auto exit node: %v", err)
+			}
+			a.requestRefresh()
+		}),
 	}
-	return mkCheck(p.HostName, false, func() {
-		if err := SetExitNode(context.Background(), p.BaseName()); err != nil {
-			log.Printf("traytail: set exit node: %v", err)
-		}
-		a.requestRefresh()
-	})
-}
-
-// exitNodeMenu builds the exit node submenu: Auto (best), own nodes,
-// and Mullvad nodes grouped by country behind a single "Mullvad" node.
-// Clicking the active entry turns exit routing off — there is no
-// separate "None" entry.
-func (a *app) exitNodeMenu(st *Status) []MenuItem {
-	exit := st.ExitNodePeer()
-	peers := st.SortPeers()
-
-	items := []MenuItem{a.autoToggle(exit)}
 
 	var own []MenuItem
-	mullvad := map[string][]MenuItem{} // country code -> nodes
+	mullvad := map[string][]ExitNodeInfo{} // country name -> nodes
 	var countries []string
+	seen := map[string]bool{} // hostname dedupe, prefer specific city over "Any"
 
-	for _, p := range peers {
-		if !p.ExitNodeOption || !p.Online {
+	for _, n := range nodes {
+		if n.Hostname == "" {
 			continue
 		}
-		active := exit != nil && exit.HostName == p.HostName
-		if p.IsMullvad() {
-			cc, _ := splitMullvad(p.HostName)
-			if _, ok := mullvad[cc]; !ok {
-				countries = append(countries, cc)
-			}
-			mullvad[cc] = append(mullvad[cc], a.exitNodeToggle(p, active))
-		} else {
-			own = append(own, a.exitNodeToggle(p, active))
+		// "Any" rows duplicate a specific city row for the same host:
+		// keep the first (specific) occurrence, skip the rest.
+		base := hostBase(n.Hostname)
+		if seen[base] {
+			continue
 		}
+		seen[base] = true
+		if !peerExitAvailable(st, n.Hostname) {
+			continue
+		}
+		if n.Country == "" {
+			own = append(own, ownExitItem(n, hostMatches(n.Hostname, activeHost), a))
+			continue
+		}
+		if _, ok := mullvad[n.Country]; !ok {
+			countries = append(countries, n.Country)
+		}
+		mullvad[n.Country] = append(mullvad[n.Country], n)
 	}
 
 	if len(own) > 0 {
@@ -293,35 +334,117 @@ func (a *app) exitNodeMenu(st *Status) []MenuItem {
 	}
 	if len(countries) > 0 {
 		sort.Strings(countries)
-		var countryNodes []MenuItem
-		for _, cc := range countries {
-			countryNodes = append(countryNodes, mkSub(strings.ToUpper(cc), mullvad[cc]))
-		}
-		items = append(items, mkSep(), mkSub("Mullvad", countryNodes))
+		items = append(items, mkSep(), mkSub("Mullvad", mullvadSubmenu(countries, mullvad, activeHost, a)))
 	}
-	if exit == nil && len(items) == 1 {
+	if len(items) == 1 {
 		items = append(items, mkSep(), mk("No exit nodes available", nil))
 	}
 	return items
 }
 
-// autoToggle is the "Auto (best)" entry backed by tailscale's auto:any
-// exit node. Active while no concrete peer is selected.
-func (a *app) autoToggle(exit *Peer) MenuItem {
-	if exit == nil {
-		return mkCheck("Auto (best)", true, func() {
-			if err := SetExitNode(context.Background(), ""); err != nil {
-				log.Printf("traytail: unset exit node: %v", err)
-			}
-			a.requestRefresh()
-		})
+// ownExitItem builds the radio item for a self-hosted exit node.
+func ownExitItem(n ExitNodeInfo, active bool, a *app) MenuItem {
+	label := n.Hostname
+	if i := strings.Index(label, "."); i > 0 {
+		label = label[:i] // strip domain: zds-nabara.tail... -> zds-nabara
 	}
-	return mkCheck("Auto (best)", false, func() {
-		if err := SetExitNode(context.Background(), "auto:any"); err != nil {
-			log.Printf("traytail: set auto exit node: %v", err)
+	return mkRadio(label, active, func() {
+		if err := SetExitNode(context.Background(), n.Hostname); err != nil {
+			log.Printf("traytail: set exit node: %v", err)
 		}
 		a.requestRefresh()
 	})
+}
+
+// mullvadSubmenu builds the country submenus, hoisting the active
+// country to the top with a ● marker.
+func mullvadSubmenu(countries []string, mullvad map[string][]ExitNodeInfo, activeHost string, a *app) []MenuItem {
+	activeCountry := ""
+	for _, c := range countries {
+		for _, n := range mullvad[c] {
+			if hostMatches(n.Hostname, activeHost) {
+				activeCountry = c
+				break
+			}
+		}
+	}
+
+	ordered := countries
+	if activeCountry != "" {
+		ordered = append([]string{activeCountry}, without(countries, activeCountry)...)
+	}
+
+	var out []MenuItem
+	for _, c := range ordered {
+		active := c == activeCountry
+		label := c
+		if active {
+			label = "● " + c
+		}
+		out = append(out, mkSub(label, cityItems(mullvad[c], activeHost, a)))
+	}
+	return out
+}
+
+// cityItems renders the nodes of one country as city-labelled radio
+// items, active first.
+func cityItems(nodes []ExitNodeInfo, activeHost string, a *app) []MenuItem {
+	var out []MenuItem
+	for _, n := range nodes {
+		n := n
+		active := hostMatches(n.Hostname, activeHost)
+		out = append(out, mkRadio(exitNodeLabel(n), active, func() {
+			if err := SetExitNode(context.Background(), n.Hostname); err != nil {
+				log.Printf("traytail: set exit node: %v", err)
+			}
+			a.requestRefresh()
+		}))
+	}
+	return out
+}
+
+// hostBase strips the trailing dot from a DNS name.
+func hostBase(host string) string {
+	return strings.TrimSuffix(host, ".")
+}
+
+// hostMatches reports whether an exit-node list hostname refers to
+// the same node as a status peer name. The list carries full DNS
+// names ("de-ber-wg-001.mullvad.ts.net") while status peers use the
+// first label ("de-ber-wg-001"), so compare first labels too.
+func hostMatches(listHost, peerHost string) bool {
+	if listHost == peerHost || hostBase(listHost) == peerHost {
+		return true
+	}
+	first := listHost
+	if i := strings.IndexAny(first, "."); i > 0 {
+		first = first[:i]
+	}
+	return first == peerHost
+}
+
+// peerExitAvailable reports whether the status peer list still shows
+// this hostname as an online exit-node option.
+func peerExitAvailable(st *Status, hostname string) bool {
+	for _, p := range st.Peer {
+		if !p.ExitNodeOption || !p.Online {
+			continue
+		}
+		if hostMatches(hostname, p.HostName) || hostMatches(hostname, p.BaseName()) {
+			return true
+		}
+	}
+	return false
+}
+
+func without(list []string, s string) []string {
+	out := make([]string, 0, len(list))
+	for _, x := range list {
+		if x != s {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // splitMullvad parses "de-fra-wg-001" into ("de", "fra").

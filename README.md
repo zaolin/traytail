@@ -38,34 +38,40 @@ go build .
 ## Menu
 
 ```
-Haruhi — binarly.io             (click = admin console)
-Copy IP: 100.65.70.92
+Haruhi — zaolin.github          (click = admin console)
+Copy IP: 100.121.168.35
 ────────────
-Profile: binarly.io ▸           (if >1 account; parent shows active)
-  ✓ philipp@binarly.io          (active: click does nothing)
-  ─ zaolin@github               (click = switch, refreshes menu)
-Exit node: fra ▸                (parent shows current selection)
-  ✓ Auto (best)                 (tailscale auto:any; active = click off)
+Profile: zaolin@github ▸        (if >1 account; parent shows active)
+  ● zaolin@github               (active: click does nothing)
+  ○ philipp@binarly.io          (click = switch, refreshes menu)
+Exit node: Berlin ▸             (parent shows full city of the active node)
+  ● Off                         (explicit off switch; active when no exit node)
+  ○ Auto (best)                 (tailscale auto:any)
   ──
-  homeserver                    (own nodes direct, radio behavior)
+  ○ zds-nabara                  (own nodes, first DNS label)
   ──
-  Mullvad ▸                     (grouped by country: DE ▸, NL ▸ …)
+  Mullvad ▸
+     ● Germany ▸                (active country hoisted to top)
+     Albania ▸  Argentina ▸ …   (full country names, sorted)
+        ● Berlin                (city labels; ● marks the active one)
 Disconnect
 ────────────
 Admin console
 Quit
 ```
 
-**Exit nodes behave like radio buttons:** only one can be active at a
-time; clicking the active entry turns exit routing off — there is no
-separate "None" entry. `Auto (best)` uses Tailscale's `auto:any` (best
-available node); once connected, the parent label shows the resolved
-city (e.g. `Exit node: ams`).
+**Exit node selection:** entries are labelled with full city/country
+names parsed from `tailscale exit-node list` (hostname fallback when
+that fails). The active country is hoisted to the top of the Mullvad
+list, and every item carries a `●`/`○` radio marker — including an
+explicit `Off` entry, so there is no click-active-to-disable trick.
+State is shown as a text glyph instead of checkmark properties because
+SNI hosts like ashell render `toggle-type: checkmark` items as switches.
 
 ## Notes
 
-- Exit node selection uses `tailscale set --exit-node=<base-name>`
-  (works identically for own nodes and Mullvad; empty = off).
+- Exit node selection uses `tailscale set --exit-node=<hostname>`;
+  labels and grouping come from `tailscale exit-node list`.
 - Works with any SNI host (ashell, waybar, KDE Plasma), not just ashell.
 
 ## Development

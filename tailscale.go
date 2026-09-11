@@ -91,6 +91,66 @@ func SetExitNode(ctx context.Context, baseName string) error {
 	return err
 }
 
+// ExitNodeInfo is one row of `tailscale exit-node list`.
+type ExitNodeInfo struct {
+	IP       string
+	Hostname string // full DNS name, e.g. de-ber-wg-001.mullvad.ts.net.
+	Country  string // full country name; empty for own nodes
+	City     string // full city name; empty for own nodes / "Any" dupes kept
+	Selected bool
+}
+
+// GetExitNodes parses the tabwriter output of `tailscale exit-node list`.
+// Columns are separated by two or more spaces so multi-word cities
+// ("Buenos Aires") survive. Own exit nodes have "-" for country/city.
+func GetExitNodes(ctx context.Context) ([]ExitNodeInfo, error) {
+	out, err := run(ctx, "exit-node", "list")
+	if err != nil {
+		return nil, fmt.Errorf("tailscale exit-node list: %w", err)
+	}
+	var nodes []ExitNodeInfo
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "  ") || strings.HasPrefix(line, " IP ") {
+			continue // header or no data
+		}
+		fields := strings.Split(strings.TrimSpace(line), "  ")
+		fields = nonEmpty(fields)
+		if len(fields) < 5 {
+			continue
+		}
+		n := ExitNodeInfo{
+			IP:       strings.TrimSpace(fields[0]),
+			Hostname: strings.TrimSpace(fields[1]),
+			Country:  dashToEmpty(fields[2]),
+			City:     dashToEmpty(fields[3]),
+		}
+		n.Selected = strings.TrimSpace(fields[4]) == "selected"
+		nodes = append(nodes, n)
+	}
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("parse exit-node list: no rows in output")
+	}
+	return nodes, nil
+}
+
+func dashToEmpty(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "-" {
+		return ""
+	}
+	return s
+}
+
+func nonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if t := strings.TrimSpace(s); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func AdvertiseExitNode(ctx context.Context, enable bool) error {
 	_, err := run(ctx, "set", fmt.Sprintf("--advertise-exit-node=%v", enable))
 	return err
