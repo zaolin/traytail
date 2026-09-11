@@ -119,6 +119,19 @@ make cover    # unit + integration coverage (~93%)
 make integration  # DBus integration tests under a session bus
 ```
 
+## Install
+
+```
+sudo make install        # build + install to /usr/local/bin
+sudo make uninstall      # remove it again
+```
+
+Custom location (no root needed):
+
+```
+make install PREFIX=$HOME/.local/bin
+```
+
 ## License
 
 [MIT](LICENSE)

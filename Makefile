@@ -1,9 +1,18 @@
-.PHONY: build test cover vet integration clean
+.PHONY: build install uninstall test cover vet integration clean
 
 GOCOVMERGE := $(shell command -v gocovmerge 2>/dev/null || echo $(HOME)/go/bin/gocovmerge)
 
+PREFIX ?= /usr/local
+BINDIR := $(PREFIX)/bin
+
 build:
 	go build -o traytail .
+
+install: build
+	install -Dm755 traytail $(DESTDIR)$(BINDIR)/traytail
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/traytail
 
 vet:
 	go vet ./...
