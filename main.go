@@ -70,6 +70,9 @@ func runApp(ctx context.Context, stop context.CancelFunc, sni trayUI) error {
 	defer sni.Close()
 	a := &app{ctx: ctx, stop: stop, sni: sni, refreshCh: make(chan struct{}, 1), smart: &smartAuto{}}
 	a.registerLoop()
+	if st, err := GetStatus(ctx); err == nil {
+		a.tickSmartAutoStartup(st, true) // startup: observe only, never apply
+	}
 	a.refresh() // initial state
 
 	t := time.NewTicker(pollInterval)
@@ -124,47 +127,92 @@ func (a *app) refresh() {
 // tickSmartAuto runs the home/away state machine. desiredTarget
 // returns the exit node hostname to apply when the state flips.
 func (a *app) tickSmartAuto(st *Status) {
+	a.tickSmartAutoStartup(st, false)
+}
+
+// tickSmartAutoStartup is tickSmartAuto with an explicit startup flag:
+// the very first observation after app start only records the home
+// state, while re-primes (after disconnect / profile switch) apply the
+// policy target immediately because the current exit node may be
+// stale or empty (profiles carry their own prefs).
+func (a *app) tickSmartAutoStartup(st *Status, startup bool) {
 	s := a.smart
-	if s == nil || !st.Running() {
+	if s == nil {
+		return
+	}
+	if !st.Running() {
+		// Disconnected: profiles carry their own exit-node prefs, so
+		// whatever was applied no longer applies. Un-prime so the
+		// reconnect (or the next profile switch) re-evaluates and
+		// re-applies the policy. No CLI calls while stopped.
+		s.mu.Lock()
+		s.primed = false
+		s.mu.Unlock()
 		return
 	}
 	lans := OwnExitNodeLANs(st)
 	home := AtHome(lans)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.primed {
 		s.primed = true
 		s.atHome = home
 		s.lastMul = LoadLastMullvad()
 		log.Printf("traytail: smart auto primed (home=%v, lastMullvad=%q)", home, s.lastMul)
-		return // first observation never applies anything
+		s.mu.Unlock()
+		if !startup {
+			// Re-primed after disconnect or profile switch: the current
+			// exit node may be stale or empty (profiles carry their own
+			// prefs), so apply the policy target right away.
+			a.applySmartTarget(home, st)
+		}
+		return
 	}
 	if home == s.atHome {
+		s.mu.Unlock()
 		return // stable: manual choices stand
 	}
 	s.atHome = home
+	s.mu.Unlock()
 
-	// Flipped. Determine the desired target.
-	var target string
-	if home {
-		nodes, _ := GetExitNodes(context.Background())
-		target = PickMullvadNode(st, nodes, s.lastMul)
-		if target != "" {
-			s.lastMul = target
-			StoreLastMullvad(target)
-		}
-	} else {
-		target = a.pickOwnNode(st)
-	}
+	// Flipped: resolve and apply outside the lock (CLI calls, state file).
+	a.applySmartTarget(home, st)
+}
+
+// applySmartTarget resolves the policy exit node for the given home
+// state and applies it. Must be called WITHOUT s.mu held: it runs CLI
+// commands and updates the last-used Mullvad record.
+func (a *app) applySmartTarget(home bool, st *Status) {
+	target := a.smartTarget(home, st)
 	if target == "" {
 		log.Printf("traytail: smart auto: no target for home=%v, keeping current", home)
 		return
+	}
+	if s := a.smart; s != nil {
+		s.mu.Lock()
+		s.lastMul = target
+		s.mu.Unlock()
 	}
 	log.Printf("traytail: smart auto: home=%v -> applying exit node %q", home, target)
 	if err := SetExitNode(context.Background(), target); err != nil {
 		log.Printf("traytail: smart auto: set exit node: %v", err)
 	}
+}
+
+// smartTarget resolves the policy exit node for the given home state:
+// home -> last-used Mullvad node (persisted), away -> first online own
+// exit node advertising a LAN. Callers must NOT hold s.mu: this may
+// update and persist the last-used Mullvad record.
+func (a *app) smartTarget(home bool, st *Status) string {
+	if home {
+		nodes, _ := GetExitNodes(context.Background())
+		target := PickMullvadNode(st, nodes, LoadLastMullvad())
+		if target != "" {
+			StoreLastMullvad(target)
+		}
+		return target
+	}
+	return a.pickOwnNode(st)
 }
 
 // pickOwnNode returns the hostname of the first online own exit node
@@ -190,9 +238,9 @@ func (a *app) requestRefresh() {
 func (a *app) buildUI(st *Status, profiles []Profile) ([]byte, string, []MenuItem) {
 	switch {
 	case !st.Running() && (st.BackendState == "NeedsLogin" || st.AuthURL != ""):
-		return iconWarning(), "Tailscale: login required", a.menuNeedsLogin(st)
+		return iconWarning(), "Tailscale: login required", a.menuNeedsLogin(st, profiles)
 	case !st.Running():
-		return iconOffline(), "Tailscale: "+st.BackendState, a.menuOffline(st)
+		return iconOffline(), "Tailscale: "+st.BackendState, a.menuOffline(st, profiles)
 	}
 
 	exit := st.ExitNodePeer()
@@ -263,30 +311,7 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 
 	// Profiles submenu: parent shows the active account; only one can
 	// be active at a time, so clicking the selected one is a no-op.
-	if len(profiles) > 1 {
-		active := ""
-		for _, p := range profiles {
-			if p.Selected {
-				active = p.Nickname
-				break
-			}
-		}
-		var profItems []MenuItem
-		for _, p := range profiles {
-			p := p
-			if p.Selected {
-				profItems = append(profItems, mkRadio(p.Nickname, true, nil))
-			} else {
-				profItems = append(profItems, mkRadio(p.Nickname, false, func() {
-					if err := SwitchProfile(context.Background(), p.ID); err != nil {
-						log.Printf("traytail: switch profile: %v", err)
-					}
-					a.requestRefresh()
-				}))
-			}
-		}
-		items = append(items, mkSub("Profile: "+active, profItems))
-	}
+	items = append(items, a.profileSubmenu(profiles)...)
 
 	// Exit nodes submenu, split into own and Mullvad (per country).
 	items = append(items, mkSub("Exit node"+exitSuffix(exit, st), a.exitNodeMenu(st, exit)))
@@ -304,6 +329,59 @@ func (a *app) menuOnline(st *Status, exit *Peer, profiles []Profile) []MenuItem 
 	}))
 	items = append(items, mk("Quit", a.stop))
 	return items
+}
+
+// profileSubmenu builds the account-switcher submenu. While running,
+// switching only changes the account; while disconnected or needing
+// login, switching also connects (`tailscale up` uses the selected
+// profile's own prefs). Switching always resets the smart-auto state
+// machine: profiles carry their own exit-node prefs, so the policy
+// must re-apply on the new profile.
+func (a *app) profileSubmenu(profiles []Profile) []MenuItem {
+	if len(profiles) <= 1 {
+		return nil
+	}
+	active := ""
+	for _, p := range profiles {
+		if p.Selected {
+			active = p.Nickname
+			break
+		}
+	}
+	var profItems []MenuItem
+	for _, p := range profiles {
+		p := p
+		if p.Selected {
+			profItems = append(profItems, mkRadio(p.Nickname, true, nil))
+			continue
+		}
+		profItems = append(profItems, mkRadio(p.Nickname, false, func() {
+			if err := SwitchProfile(context.Background(), p.ID); err != nil {
+				log.Printf("traytail: switch profile: %v", err)
+				return
+			}
+			a.onProfileSwitched()
+			a.requestRefresh()
+		}))
+	}
+	return []MenuItem{mkSub("Profile: "+active, profItems)}
+}
+
+// onProfileSwitched runs after a successful profile switch: smart auto
+// must re-prime because the new profile's exit-node prefs differ.
+func (a *app) onProfileSwitched() {
+	if s := a.smart; s != nil {
+		s.mu.Lock()
+		s.primed = false
+		s.mu.Unlock()
+	}
+	st, err := GetStatus(context.Background())
+	if err == nil && !st.Running() {
+		// Offline switch: bring the new profile up right away.
+		if err := Connect(context.Background()); err != nil {
+			log.Printf("traytail: connect after profile switch: %v", err)
+		}
+	}
 }
 
 // exitSuffix labels the Exit node submenu parent with the current
@@ -663,7 +741,7 @@ func splitMullvad(host string) (cc, city string) {
 	return host, ""
 }
 
-func (a *app) menuOffline(st *Status) []MenuItem {
+func (a *app) menuOffline(st *Status, profiles []Profile) []MenuItem {
 	items := []MenuItem{
 		mk("Tailscale: "+st.BackendState, nil),
 		mkSep(),
@@ -674,6 +752,7 @@ func (a *app) menuOffline(st *Status) []MenuItem {
 			a.requestRefresh()
 		}),
 	}
+	items = append(items, a.profileSubmenu(profiles)...)
 	if st.AuthURL != "" {
 		items = append(items, mk("Log in", func() { openURL(st.AuthURL) }))
 	}
@@ -682,13 +761,15 @@ func (a *app) menuOffline(st *Status) []MenuItem {
 	return items
 }
 
-func (a *app) menuNeedsLogin(st *Status) []MenuItem {
+func (a *app) menuNeedsLogin(st *Status, profiles []Profile) []MenuItem {
 	items := []MenuItem{mk("Login required", nil), mkSep()}
 	if st.AuthURL != "" {
-		items = append(items, mk("Open login page", func() { openURL(st.AuthURL) }), mkSep())
+		items = append(items, mk("Open login page", func() { openURL(st.AuthURL) }))
 	} else {
-		items = append(items, mk("Run 'tailscale up' to log in", nil), mkSep())
+		items = append(items, mk("Run 'tailscale up' to log in", nil))
 	}
+	items = append(items, a.profileSubmenu(profiles)...)
+	items = append(items, mkSep())
 	items = append(items, mk("Quit", a.stop))
 	return items
 }

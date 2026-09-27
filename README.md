@@ -61,6 +61,11 @@ Admin console
 Quit
 ```
 
+While **disconnected** the menu keeps the Profile submenu: switching
+profiles offline switches *and* connects (`tailscale up` uses the
+selected profile's own preferences). The login-required menu shows
+profiles too, so you can switch accounts before re-authenticating.
+
 **Exit node selection:** entries are labelled with full city/country
 names parsed from `tailscale exit-node list` (hostname fallback when
 that fails). The active country is hoisted to the top of the Mullvad
@@ -76,7 +81,10 @@ node) it routes through the own exit node; when *at home* it switches
 to the last-used Mullvad node (persisted across restarts). The policy
 re-applies only when the home/away state flips — manual selections and
 Off stay untouched while the state is stable, and any manual pick or
-Off disables smart auto.
+Off disables smart auto. Smart auto re-applies after **reconnecting**
+and after **switching profiles** (profiles carry their own exit-node
+preferences), so it keeps working across disconnects and account
+switches.
 
 **Deselecting the own exit node** (clicking its `●` item) applies the
 last-used Mullvad node instead — regardless of whether smart auto is

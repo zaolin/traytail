@@ -383,11 +383,25 @@ func TestMenuOnlineProfiles(t *testing.T) {
 	}
 	other.OnClick()
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := ft.lastCall(t); got[0] != "switch" || got[1] != "p2" {
-		t.Errorf("switch ran %v", got)
+	calls := ft.callsSoFar(t)
+	// find the `switch p2` call among all recorded calls (menu build
+	// runs `exit-node list` first, switch triggers a status refresh)
+	var switchCall []string
+	for i, c := range calls {
+		if c[0] == "switch" && c[1] == "p2" {
+			switchCall = c
+			// online switch: the very next CLI call must not be `up`
+			if i+1 < len(calls) && calls[i+1][0] == "up" {
+				t.Errorf("online profile switch must not run `up`, calls: %v", calls)
+			}
+			break
+		}
+	}
+	if switchCall == nil {
+		t.Errorf("switch call missing: %v", calls)
 	}
 	select {
 	case <-a.refreshCh:
@@ -949,14 +963,37 @@ func TestTickSmartAutoPrimeOnly(t *testing.T) {
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
 
-	a.tickSmartAuto(smartTestStatus()) // prime
+	a.tickSmartAutoStartup(smartTestStatus(), true) // startup prime
 	if a.smart.primed != true || a.smart.atHome != false {
 		t.Fatalf("prime state wrong: %+v", a.smart)
 	}
 	for _, c := range ft.callsSoFar(t) {
 		if c[0] == "set" {
-			t.Fatalf("priming must not apply anything, ran %v", c)
+			t.Fatalf("startup priming must not apply anything, ran %v", c)
 		}
+	}
+}
+
+func TestTickSmartAutoRePrimeApplies(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	restoreIfaceAddrs(t, nil) // away
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{} // simulates un-primed state after disconnect/profile switch
+
+	a.tickSmartAuto(smartTestStatus()) // re-prime applies immediately
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil || setCall[1] != "--exit-node=zds-nabara" {
+		t.Errorf("re-prime should apply the policy target, ran %v", ft.callsSoFar(t))
 	}
 }
 
@@ -1206,13 +1243,157 @@ func mullvadSub(items []MenuItem) []MenuItem {
 	return nil
 }
 
+// ---- offline profiles + smart-auto across disconnect/profile switch ----
+
+func TestMenuOfflineShowsProfiles(t *testing.T) {
+	installFakeTailscale(t)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Stopped"}
+	profiles := []Profile{
+		{ID: "p1", Nickname: "one@x", Selected: true},
+		{ID: "p2", Nickname: "two@y"},
+	}
+	items := a.menuOffline(st, profiles)
+
+	sub := findLabel(items, "Profile: one@x")
+	if sub == nil {
+		t.Fatalf("offline menu should show profiles: %v", labels(items))
+	}
+	if !hasLabel(items, "● one@x") || !hasLabel(items, "○ two@y") {
+		t.Errorf("profile radio items missing: %v", labels(items))
+	}
+	if !hasLabel(items, "Connect") || !hasLabel(items, "Quit") {
+		t.Errorf("Connect/Quit missing: %v", labels(items))
+	}
+}
+
+func TestMenuOfflineSwitchConnects(t *testing.T) {
+	ft := installFakeTailscale(t)
+	// status fetched by onProfileSwitched; report Stopped so it connects
+	ft.setResponse(t, `{"BackendState":"Stopped"}`)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	st := &Status{BackendState: "Stopped"}
+	profiles := []Profile{
+		{ID: "p1", Nickname: "one@x", Selected: true},
+		{ID: "p2", Nickname: "two@y"},
+	}
+	items := a.menuOffline(st, profiles)
+
+	other := findLabel(items, "○ two@y")
+	other.OnClick()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 3 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	calls := ft.callsSoFar(t)
+	// expect: switch p2 -> status --json -> up
+	var swIdx, upIdx = -1, -1
+	for i, c := range calls {
+		if c[0] == "switch" && len(c) > 1 && c[1] == "p2" {
+			swIdx = i
+		}
+		if c[0] == "up" {
+			upIdx = i
+		}
+	}
+	if swIdx == -1 {
+		t.Fatalf("switch call missing: %v", calls)
+	}
+	if upIdx == -1 {
+		t.Fatalf("offline switch should auto-connect (up missing): %v", calls)
+	}
+	if upIdx < swIdx {
+		t.Errorf("`up` ran before `switch`: %v", calls)
+	}
+	if a.smart != nil && a.smartPrimed() {
+		t.Error("profile switch should un-prime smart auto")
+	}
+}
+
+func TestMenuNeedsLoginShowsProfiles(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "NeedsLogin"}
+	profiles := []Profile{
+		{ID: "p1", Nickname: "one@x", Selected: true},
+		{ID: "p2", Nickname: "two@y"},
+	}
+	items := a.menuNeedsLogin(st, profiles)
+	if !hasLabel(items, "Profile: one@x") {
+		t.Errorf("needs-login menu should show profiles: %v", labels(items))
+	}
+}
+
+func TestTickSmartAutoReAppliesAfterDisconnect(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setExitNodeList(t, exitNodeListFixture)
+	ft.setResponse(t, `{"BackendState":"Running"}`) // for enable/re-apply GetStatus
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	// prime: away
+	restoreIfaceAddrs(t, nil)
+	a.tickSmartAuto(smartTestStatus())
+
+	// disconnect: un-primes, no CLI calls
+	nBefore := len(ft.callsSoFar(t))
+	stopped := &Status{BackendState: "Stopped", Peer: smartTestStatus().Peer}
+	a.tickSmartAuto(stopped)
+	if a.smartPrimed() {
+		t.Fatal("stopped state should un-prime smart auto")
+	}
+	if got := len(ft.callsSoFar(t)); got != nBefore {
+		t.Errorf("stopped tick issued CLI calls: %d -> %d", nBefore, got)
+	}
+
+	// reconnect (still away): re-primes AND re-applies own node
+	a.tickSmartAuto(smartTestStatus())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < nBefore+2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	calls := ft.callsSoFar(t)
+	var setCall []string
+	for _, c := range calls[nBefore:] {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil || setCall[1] != "--exit-node=zds-nabara" {
+		t.Errorf("reconnect should re-apply own node (away), calls after stop: %v", calls[nBefore:])
+	}
+}
+
+func TestProfileSwitchResetsSmartAuto(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true, atHome: true}
+
+	a.onProfileSwitched()
+	if a.smartPrimed() {
+		t.Error("profile switch should un-prime smart auto")
+	}
+}
+
+func TestOnProfileSwitchedRunningDoesNotConnect(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setResponse(t, `{"BackendState":"Running"}`)
+	a := newTestApp(t, &fakeUI{})
+
+	a.onProfileSwitched()
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "up" {
+			t.Errorf("online profile switch must not run `up`: %v", ft.callsSoFar(t))
+		}
+	}
+}
+
 // ---- menuOffline / menuNeedsLogin ----
 
 func TestMenuOfflineConnectAndQuit(t *testing.T) {
 	ft := installFakeTailscale(t)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Stopped"}
-	items := a.menuOffline(st)
+	items := a.menuOffline(st, nil)
 
 	connect := findLabel(items, "Connect")
 	if connect == nil {
@@ -1245,7 +1426,7 @@ func TestMenuOfflineLogIn(t *testing.T) {
 	rec := restoreExec(t)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Stopped", AuthURL: "https://login.tailscale.com/a/x"}
-	items := a.menuOffline(st)
+	items := a.menuOffline(st, nil)
 	login := findLabel(items, "Log in")
 	if login == nil {
 		t.Fatal("Log in missing")
@@ -1259,7 +1440,7 @@ func TestMenuOfflineLogIn(t *testing.T) {
 func TestMenuNeedsLoginQuit(t *testing.T) {
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "NeedsLogin"}
-	items := a.menuNeedsLogin(st)
+	items := a.menuNeedsLogin(st, nil)
 	quit := findLabel(items, "Quit")
 	quit.OnClick()
 	select {
@@ -1273,7 +1454,7 @@ func TestMenuNeedsLoginOpenLogin(t *testing.T) {
 	rec := restoreExec(t)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "NeedsLogin", AuthURL: "https://login.tailscale.com/a/x"}
-	items := a.menuNeedsLogin(st)
+	items := a.menuNeedsLogin(st, nil)
 	open := findLabel(items, "Open login page")
 	open.OnClick()
 	if len(rec.all()) != 1 {
