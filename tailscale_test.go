@@ -15,8 +15,7 @@ type fakeTailscale struct {
 	dir     string
 	logPath string
 
-	exitNodeList string
-	debugPrefs   string
+	debugPrefs string
 
 	mu     sync.Mutex
 	calls  [][]string
@@ -65,18 +64,6 @@ func (ft *fakeTailscale) setFail(t *testing.T) {
 	}
 }
 
-// setExitNodeList writes the canned `tailscale exit-node list` table.
-// Subcommand-aware: exit-node list returns this; status/switch still
-// use resp.txt.
-func (ft *fakeTailscale) setExitNodeList(t *testing.T, table string) {
-	t.Helper()
-	ft.exitNodeList = table
-	if err := os.WriteFile(filepath.Join(ft.dir, "exitnodes.txt"), []byte(table), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ft.rewriteScript(t)
-}
-
 // setDebugPrefs writes the canned `tailscale debug prefs` JSON. An
 // empty string omits the file, so `cat` yields nothing (parse fails).
 func (ft *fakeTailscale) setDebugPrefs(t *testing.T, prefsJSON string) {
@@ -102,7 +89,6 @@ func (ft *fakeTailscale) rewriteScript(t *testing.T) {
 	}
 	cli := filepath.Join(binDir, "tailscale")
 	script := "#!/bin/sh\necho \"$@\" >> " + ft.logPath + "\n" +
-		"if [ \"$1\" = \"exit-node\" ]; then cat " + filepath.Join(ft.dir, "exitnodes.txt") + " 2>/dev/null; exit 0; fi\n" +
 		"if [ \"$1\" = \"debug\" ]; then if [ -f " + filepath.Join(ft.dir, "prefs.json") + " ]; then cat " + filepath.Join(ft.dir, "prefs.json") + "; else echo '{}'; fi; exit 0; fi\n" +
 		"if [ -f " + filepath.Join(ft.dir, "fail") + " ]; then echo 'simulated cli failure' >&2; exit 1; fi\n" +
 		"cat " + filepath.Join(ft.dir, "resp.txt") + " 2>/dev/null || true\n"

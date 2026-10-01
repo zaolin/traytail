@@ -12,11 +12,12 @@ No GUI toolkit. Pure Go, one dependency (`github.com/godbus/dbus/v5`), ~900 line
 
 ## Features
 
-- Status icon: connected (filled) / offline (hollow) / exit node in use (green ring) / login required (amber)
+- Status icon: connected (filled) / offline (hollow) / exit node in use (green ring) / login required or captive portal (amber)
+- **Captive portal handling** — reads NetworkManager's connectivity state over DBus (no `nmcli` shell-outs): when a Wi-Fi portal hijacks the network, traytail disconnects tailscale, shows `Open portal login` in the menu (opens the discovered login URL in chromium), and reconnects tailscale once the portal clears
 - **Multiple profiles** — switch accounts (`tailscale switch`) from the Profile submenu
-- **Exit nodes**, cleanly split:
+- **Exit nodes**, derived straight from `tailscale status --json` (Location data), cleanly split:
   - *Own exit nodes* — regular tailnet peers with `ExitNodeOption`
-  - *Mullvad VPN* — grouped by country (`tag:mullvad-exit-node-*`)
+  - *Mullvad VPN* — grouped by country (`Location.Country`)
 - Connect / Disconnect, copy Tailscale IP, open admin console
 - Left-click on the bar icon opens the menu; updates are pushed via
   `NewIcon` / `LayoutUpdated` signals (5s poll, deduplicated)
@@ -62,14 +63,47 @@ Quit
 ```
 
 While **disconnected** the menu keeps the Profile submenu: switching
-profiles offline switches *and* connects (`tailscale up` uses the
+ profiles offline switches *and* connects (`tailscale up` uses the
 selected profile's own preferences). The login-required menu shows
 profiles too, so you can switch accounts before re-authenticating.
 
+**Captive portals:** when NetworkManager reports `PORTAL` connectivity
+(the machine's configured connectivity-check gets hijacked), traytail
+1. disconnects tailscale automatically (exit-node traffic bypasses the
+portal), 2. switches the menu to a portal view with `Open portal login`
+(it reads the check URI from NM over DBus and fetches it without
+redirects to discover the login URL, then opens it in chromium), and
+3. reconnects tailscale automatically once connectivity is restored.
+The `Retry connectivity check` entry re-runs discovery by hand.
+
+Detection details and hardening:
+
+- traytail triggers a fresh NM `CheckConnectivity` once a minute
+  (NM's own retry interval defaults to 300s) so a newly joined portal
+  is noticed within ~60s instead of 5; between triggers the cached
+  verdict is read.
+- Two consecutive `PORTAL` readings are required before tailscale is
+  disconnected (flap protection).
+- Portals serve their login page in two shapes: HTTP-redirects of the
+  check request (the `Location` header is the login URL) and
+  direct-200 HTML at the same URL. For the second shape, traytail
+  falls back to the default gateway read from NM
+  (`PrimaryConnection -> Ip4Config -> Gateway`) and offers
+  `http://<gateway>/` as the login URL.
+- If the NM connectivity check is disabled entirely, traytail logs a
+  one-time warning and portal detection is inactive.
+
+Known limitations: detection is NM-only (no iwd/networkd support);
+while a tailscale tunnel is active NM's check rides the tunnel and
+cannot see the portal — detection matters exactly when the tunnel is
+broken, which the disconnect/reconnect cycle handles.
+
 **Exit node selection:** entries are labelled with full city/country
-names parsed from `tailscale exit-node list` (hostname fallback when
-that fails). The active country is hoisted to the top of the Mullvad
-list, and every item carries a `●`/`○` radio marker — including an
+names taken from the tailnet's own `Location` data (via
+`tailscale status --json` — the same source as `tailscale exit-node
+list`, minus one subprocess). The active country is hoisted to the top
+of the Mullvad list, and every item carries a `●`/`○` radio marker —
+including an
 explicit `Off` entry, so there is no click-active-to-disable trick.
 State is shown as a text glyph instead of checkmark properties because
 SNI hosts like ashell render `toggle-type: checkmark` items as switches.
@@ -94,7 +128,19 @@ on. Active nodes are matched by Tailscale IP, so a user-renamed device
 ## Notes
 
 - Exit node selection uses `tailscale set --exit-node=<hostname>`;
-  labels and grouping come from `tailscale exit-node list`.
+  labels and grouping come from the tailnet's own `Location` data in
+  `tailscale status --json`.
+- Captive-portal detection reads NetworkManager over the system DBus
+  directly (`org.freedesktop.NetworkManager.Connectivity` +
+  `ConnectivityCheckUri`) — no `nmcli` subprocesses. NM's connectivity
+  check must be enabled for it to work. Some distros ship it disabled
+  even with a `uri` configured — Arch-based systems often need:
+  ```ini
+  # /etc/NetworkManager/conf.d/connectivity.conf
+  [connectivity]
+  enabled=true
+  ```
+  When disabled, traytail logs a one-time warning at startup.
 - Works with any SNI host (ashell, waybar, KDE Plasma), not just ashell.
 
 ## ashell

@@ -19,6 +19,9 @@ var pollInterval = 5 * time.Second
 
 var registerRetryDelay = 3 * time.Second
 
+// Route nm.go warnings through the app logger.
+func init() { logWarnf = func(format string, args ...any) { log.Printf("traytail: "+format, args...) } }
+
 // execCommand is a seam for tests; production code always uses exec.Command.
 var execCommand = exec.Command
 
@@ -39,6 +42,19 @@ type app struct {
 	// smart-auto state
 	smart       *smartAuto
 	execCommand func(string, ...string) *exec.Cmd // nil = global execCommand
+
+	// captive-portal state
+	portal portalWatcher
+}
+
+// portalWatcher tracks NetworkManager connectivity and the captive
+// portal login URL discovered from the hijacked connectivity check.
+type portalWatcher struct {
+	mu         sync.Mutex
+	detected   bool
+	url        string
+	reupNeeded bool // tailscale was auto-disconnected; re-up on clear
+	streak     int  // consecutive PORTAL readings (hysteresis)
 }
 
 // smartAuto tracks the home/away state machine. It applies the policy
@@ -113,10 +129,11 @@ func (a *app) refresh() {
 	}
 	profiles, _ := GetProfiles(a.ctx)
 
+	a.tickPortal(st)
 	a.tickSmartAuto(st)
 
 	icon, tooltip, items := a.buildUI(st, profiles)
-	key := dedupKey(st, profiles, items)
+	key := dedupKey(st, profiles, items) + "|" + portalKey(a)
 	if key == a.last {
 		return
 	}
@@ -205,7 +222,7 @@ func (a *app) applySmartTarget(home bool, st *Status) {
 // update and persist the last-used Mullvad record.
 func (a *app) smartTarget(home bool, st *Status) string {
 	if home {
-		nodes, _ := GetExitNodes(context.Background())
+		nodes := ExitNodeInfos(st)
 		target := PickMullvadNode(st, nodes, LoadLastMullvad())
 		if target != "" {
 			StoreLastMullvad(target)
@@ -217,6 +234,86 @@ func (a *app) smartTarget(home bool, st *Status) string {
 
 // pickOwnNode returns the hostname of the first online own exit node
 // advertising a LAN, or "" when none is available.
+// tickPortal runs the captive-portal state machine ahead of every UI
+// refresh: when NetworkManager reports a portal, disconnect tailscale
+// (exit-node traffic can't reach the hijacking portal) and remember to
+// re-up; when the portal clears, bring tailscale back up.
+func (a *app) tickPortal(st *Status) {
+	p := &a.portal
+	state, url := CheckPortal(context.Background())
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch state {
+	case nmConnectivityPortal:
+		// Hysteresis: require consecutive PORTAL readings before
+		// acting, so a single flapping check can't bounce tailscale.
+		p.streak++
+		if !p.detected && p.streak < portalHysteresis {
+			return // arm the detection, act when the streak completes
+		}
+		if !p.detected {
+			p.detected = true
+			p.url = url
+			log.Printf("traytail: captive portal detected (%s), url=%q", portalStateName(state), url)
+		} else if p.url == "" && url != "" {
+			p.url = url // retry found the login URL
+			log.Printf("traytail: portal login URL discovered: %q", url)
+		}
+		if st.Running() {
+			log.Printf("traytail: portal active -> disconnecting tailscale")
+			if err := Disconnect(context.Background()); err != nil {
+				log.Printf("traytail: portal disconnect: %v", err)
+			}
+			p.reupNeeded = true
+		}
+	case nmConnectivityFull, nmConnectivityLimited:
+		p.streak = 0
+		if p.detected {
+			log.Printf("traytail: portal cleared (%s)", portalStateName(state))
+		}
+		p.detected = false
+		p.url = ""
+		if p.reupNeeded && !st.Running() {
+			p.reupNeeded = false
+			log.Printf("traytail: portal cleared -> reconnecting tailscale")
+			if err := Connect(context.Background()); err != nil {
+				log.Printf("traytail: portal reconnect: %v", err)
+			}
+			return
+		}
+		p.reupNeeded = false
+	default:
+		// unknown/unreadable NM state: leave things untouched
+	}
+}
+
+// portalInfo snapshots the portal watcher state.
+func (a *app) portalInfo() (bool, string) {
+	a.portal.mu.Lock()
+	defer a.portal.mu.Unlock()
+	return a.portal.detected, a.portal.url
+}
+
+// openPortal opens the captive-portal login page in the first
+// available browser: chromium-browser, chromium, then xdg-open.
+func openPortal(url string) {
+	for _, tool := range [][]string{{"chromium-browser"}, {"chromium"}, {"xdg-open"}} {
+		if execCommand(tool[0], url).Start() == nil {
+			return
+		}
+	}
+}
+
+// portalKey renders the portal watcher state for the dedup key.
+func portalKey(a *app) string {
+	detected, url := a.portalInfo()
+	if !detected {
+		return ""
+	}
+	return "portal:" + url
+}
+
 func (a *app) pickOwnNode(st *Status) string {
 	for _, p := range st.SortPeers() {
 		if p.ExitNodeOption && p.Online && !p.IsMullvad() && len(p.PrimaryRoutes) > 0 {
@@ -236,11 +333,15 @@ func (a *app) requestRefresh() {
 
 // buildUI picks icon, tooltip and the full menu tree for the current state.
 func (a *app) buildUI(st *Status, profiles []Profile) ([]byte, string, []MenuItem) {
+	// Captive portal beats every other state for attention (amber).
+	if detected, url := a.portalInfo(); detected {
+		return iconWarning(), "Tailscale: Wi-Fi captive portal", a.menuPortal(st, url, profiles)
+	}
 	switch {
 	case !st.Running() && (st.BackendState == "NeedsLogin" || st.AuthURL != ""):
 		return iconWarning(), "Tailscale: login required", a.menuNeedsLogin(st, profiles)
 	case !st.Running():
-		return iconOffline(), "Tailscale: "+st.BackendState, a.menuOffline(st, profiles)
+		return iconOffline(), "Tailscale: " + st.BackendState, a.menuOffline(st, profiles)
 	}
 
 	exit := st.ExitNodePeer()
@@ -385,17 +486,15 @@ func (a *app) onProfileSwitched() {
 }
 
 // exitSuffix labels the Exit node submenu parent with the current
-// selection. Prefers the full city/country from `exit-node list`
-// ("Exit node: Berlin"), falling back to the hostname.
+// selection. Prefers the full city/country from the status-derived
+// exit-node table ("Exit node: Berlin"), falling back to the hostname.
 func exitSuffix(exit *Peer, st *Status) string {
 	if exit == nil {
 		return ": off"
 	}
-	if nodes, err := GetExitNodes(context.Background()); err == nil {
-		for _, n := range nodes {
-			if n.Selected {
-				return ": " + exitNodeLabel(n)
-			}
+	for _, n := range ExitNodeInfos(st) {
+		if n.Selected {
+			return ": " + exitNodeLabel(n)
 		}
 	}
 	return ": " + exitHostName(*exit)
@@ -435,7 +534,7 @@ func (a *app) enableSmartAuto() {
 
 	var target string
 	if home {
-		nodes, _ := GetExitNodes(context.Background())
+		nodes := ExitNodeInfos(st)
 		target = PickMullvadNode(st, nodes, a.smart.lastMul)
 		if target != "" {
 			a.smart.lastMul = target
@@ -487,7 +586,7 @@ func exitHostName(p Peer) string {
 // Auto is traytail's smart policy: away -> own exit node (home LAN
 // reachability), home -> last-used Mullvad node.
 func (a *app) exitNodeMenu(st *Status, exit *Peer) []MenuItem {
-	nodes, _ := GetExitNodes(context.Background())
+	nodes := ExitNodeInfos(st)
 	auto := exit != nil && a.smartPrimed()
 
 	// In smart-auto mode traytail itself applied the concrete node, so
@@ -602,7 +701,7 @@ func (a *app) applyLastMullvad() string {
 		log.Printf("traytail: last-used mullvad: %v", err)
 		return ""
 	}
-	nodes, _ := GetExitNodes(context.Background())
+	nodes := ExitNodeInfos(st)
 	target := PickMullvadNode(st, nodes, LoadLastMullvad())
 	if target == "" {
 		log.Printf("traytail: last-used mullvad: no online Mullvad node available")
@@ -741,6 +840,31 @@ func splitMullvad(host string) (cc, city string) {
 	return host, ""
 }
 
+// menuPortal is shown while a captive portal is active: open the
+// login page, retry the check manually, switch accounts, or quit.
+func (a *app) menuPortal(st *Status, url string, profiles []Profile) []MenuItem {
+	items := []MenuItem{mk("Wi-Fi captive portal detected", nil), mkSep()}
+	if url != "" {
+		u := url
+		items = append(items, mk("Open portal login", func() { openPortal(u) }))
+	} else {
+		items = append(items, mk("No login URL discovered yet", nil))
+	}
+	items = append(items, mk("Retry connectivity check", func() {
+		state, u := CheckPortal(context.Background())
+		if u != "" {
+			openPortal(u)
+		} else if state == nmConnectivityPortal {
+			log.Printf("traytail: manual retry: portal still present, no URL")
+		}
+		a.requestRefresh()
+	}))
+	items = append(items, a.profileSubmenu(profiles)...)
+	items = append(items, mkSep())
+	items = append(items, mk("Quit", a.stop))
+	return items
+}
+
 func (a *app) menuOffline(st *Status, profiles []Profile) []MenuItem {
 	items := []MenuItem{
 		mk("Tailscale: "+st.BackendState, nil),
@@ -791,6 +915,7 @@ func openURL(url string) {
 }
 
 // dedupKey builds a string that changes whenever anything UI-relevant changes.
+// portalState must be set from the caller (refresh): "" or "portal:url".
 func dedupKey(st *Status, profiles []Profile, items []MenuItem) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s|%s|%s|", st.BackendState, st.SelfIP(), st.AuthURL)

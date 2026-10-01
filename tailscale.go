@@ -26,15 +26,25 @@ type Status struct {
 }
 
 type Peer struct {
-	ID             string   `json:"ID"`
-	HostName       string   `json:"HostName"`
-	DNSName        string   `json:"DNSName"`
-	Online         bool     `json:"Online"`
-	ExitNodeOption bool     `json:"ExitNodeOption"`
-	ExitNode       bool     `json:"ExitNode"`
-	Tags           []string `json:"Tags"`
-	TailscaleIPs   []string `json:"TailscaleIPs"`
-	PrimaryRoutes  []string `json:"PrimaryRoutes"`
+	ID             string    `json:"ID"`
+	HostName       string    `json:"HostName"`
+	DNSName        string    `json:"DNSName"`
+	Online         bool      `json:"Online"`
+	ExitNodeOption bool      `json:"ExitNodeOption"`
+	ExitNode       bool      `json:"ExitNode"`
+	Tags           []string  `json:"Tags"`
+	TailscaleIPs   []string  `json:"TailscaleIPs"`
+	PrimaryRoutes  []string  `json:"PrimaryRoutes"`
+	Location       *Location `json:"Location"`
+}
+
+// Location is the geo info tailscale attaches to exit nodes (Mullvad).
+type Location struct {
+	Country     string  `json:"Country"`
+	CountryCode string  `json:"CountryCode"`
+	City        string  `json:"City"`
+	CityCode    string  `json:"CityCode"`
+	Priority    float64 `json:"Priority"`
 }
 
 type Profile struct {
@@ -129,55 +139,42 @@ func AutoExitNodeActive(ctx context.Context) bool {
 	return p.AutoExitNode != ""
 }
 
-// GetExitNodes parses the tabwriter output of `tailscale exit-node list`.
-// Columns are separated by two or more spaces so multi-word cities
-// ("Buenos Aires") survive. Own exit nodes have "-" for country/city.
-func GetExitNodes(ctx context.Context) ([]ExitNodeInfo, error) {
-	out, err := run(ctx, "exit-node", "list")
-	if err != nil {
-		return nil, fmt.Errorf("tailscale exit-node list: %w", err)
-	}
+// ExitNodeInfos derives the exit-node table from a status struct —
+// the same data `tailscale exit-node list` renders (verified against
+// the CLI source): one row per ExitNodeOption peer; IP/hostname from
+// the peer; country/city from Location (own nodes carry none);
+// Selected from the ExitNode flag. Nodes WITHOUT a Location are "own"
+// exit nodes and appear once each.
+func ExitNodeInfos(st *Status) []ExitNodeInfo {
 	var nodes []ExitNodeInfo
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "  ") || strings.HasPrefix(line, " IP ") {
-			continue // header or no data
-		}
-		fields := strings.Split(strings.TrimSpace(line), "  ")
-		fields = nonEmpty(fields)
-		if len(fields) < 5 {
+	for _, p := range st.SortPeers() {
+		if !p.ExitNodeOption {
 			continue
 		}
 		n := ExitNodeInfo{
-			IP:       strings.TrimSpace(fields[0]),
-			Hostname: strings.TrimSpace(fields[1]),
-			Country:  dashToEmpty(fields[2]),
-			City:     dashToEmpty(fields[3]),
+			IP:       firstIPv4(p.TailscaleIPs),
+			Hostname: p.BaseName(),
+			Selected: p.ExitNode,
 		}
-		n.Selected = strings.TrimSpace(fields[4]) == "selected"
+		if p.Location != nil {
+			n.Country = p.Location.Country
+			n.City = p.Location.City
+		}
 		nodes = append(nodes, n)
 	}
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf("parse exit-node list: no rows in output")
-	}
-	return nodes, nil
+	return nodes
 }
 
-func dashToEmpty(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "-" {
-		return ""
-	}
-	return s
-}
-
-func nonEmpty(in []string) []string {
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if t := strings.TrimSpace(s); t != "" {
-			out = append(out, t)
+func firstIPv4(ips []string) string {
+	for _, ip := range ips {
+		if !strings.Contains(ip, ":") {
+			return strings.TrimSuffix(ip, "/32")
 		}
 	}
-	return out
+	if len(ips) > 0 {
+		return strings.TrimSuffix(ips[0], "/32")
+	}
+	return ""
 }
 
 func AdvertiseExitNode(ctx context.Context, enable bool) error {

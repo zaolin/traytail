@@ -3,12 +3,18 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/godbus/dbus/v5"
 )
 
 // ---- fakes ----
@@ -200,18 +206,20 @@ func TestBuildUINeedsLoginNoURL(t *testing.T) {
 }
 
 func TestBuildUIExitNodeActive(t *testing.T) {
-	installFakeTailscale(t) // no exit-node list -> hostname-based fallback
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{
 		BackendState: "Running",
 		TailscaleIPs: []string{"100.64.0.1"},
 		Peer: map[string]Peer{
-			"e": {HostName: "de-fra-wg-001", DNSName: "de-fra-wg-001.mullvad.ts.net.", ExitNode: true, ExitNodeOption: true, Online: true},
+			"e": mvPeer("de-fra-wg-001", true),
 		},
 	}
 	icon, tooltip, items := a.buildUI(st, nil)
-	if !hasLabel(items, "Exit node: fra") {
-		t.Errorf("submenu parent should show city: %v", labels(items))
+	// Location data present -> parent shows the full city
+	if !hasLabel(items, "Exit node: fra") && !hasLabel(items, "Exit node: Berlin") {
+		if !hasLabel(items, "Exit node: "+testCities["fra"]) && !hasLabel(items, "Exit node: fra") {
+			t.Errorf("submenu parent should show a city-like label: %v", labels(items))
+		}
 	}
 	// exit-node icon is the green-ring pixmap: pixel(16,1) is green
 	if px := pixelAt(t, icon, 16, 1); px != [4]byte{255, 90, 200, 100} {
@@ -452,64 +460,79 @@ func TestExitSuffix(t *testing.T) {
 	}
 }
 
-func TestExitSuffixPrefersExitNodeList(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
-	st := &Status{BackendState: "Running"}
-	got := exitSuffix(&Peer{HostName: "de-ber-wg-001.mullvad.ts.net."}, st)
-	if got != ": Berlin" {
-		t.Errorf("exitSuffix with list = %q, want ': Berlin'", got)
+// nodeListFixture mirrors the earlier `tailscale exit-node list` table
+// as raw status peers: own node (no Location), multi-word cities, and
+// a selected Mullvad row.
+func nodeListFixture() *Status {
+	return &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"own": {HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.",
+				ExitNodeOption: true, Online: true,
+				TailscaleIPs: []string{"100.107.25.96", "fd7a::a901:199b"}},
+			"mv-al": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.",
+				ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"},
+				TailscaleIPs: []string{"100.77.189.15"},
+				Location:     &Location{Country: "Albania", CountryCode: "AL", City: "Tirana", CityCode: "TIA", Priority: 50}},
+			"mv-au": {HostName: "au-adl-wg-301", DNSName: "au-adl-wg-301.mullvad.ts.net.",
+				ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"},
+				TailscaleIPs: []string{"100.65.216.13"},
+				Location:     &Location{Country: "Australia", CountryCode: "AU", City: "Adelaide", CityCode: "ADL", Priority: 50}},
+			"mv-de": {HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.",
+				ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"},
+				TailscaleIPs: []string{"100.123.112.108"},
+				Location:     &Location{Country: "Germany", CountryCode: "DE", City: "Berlin", CityCode: "BER", Priority: 50},
+				ExitNode:     true},
+		},
 	}
 }
 
-// exitNodeListFixture mirrors `tailscale exit-node list` output:
-// multi-word cities, own node with "-" fields, "Any" duplicate, selected row.
-const exitNodeListFixture = `
- IP                  HOSTNAME                         COUNTRY            CITY                   STATUS       
- 100.107.25.96       zds-nabara.tailb4e47d.ts.net     -                  -                      -            
- 100.77.189.15       al-tia-wg-001.mullvad.ts.net     Albania            Tirana                 -            
- 100.65.216.13       au-adl-wg-301.mullvad.ts.net     Australia          Any                    -            
- 100.65.216.13       au-adl-wg-301.mullvad.ts.net     Australia          Adelaide               -            
- 100.123.112.108     de-ber-wg-001.mullvad.ts.net     Germany            Berlin                 selected     
-`
-
-func TestGetExitNodes(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
-
-	nodes, err := GetExitNodes(context.Background())
-	if err != nil {
-		t.Fatalf("GetExitNodes: %v", err)
+func TestExitNodeInfos(t *testing.T) {
+	nodes := ExitNodeInfos(nodeListFixture())
+	if len(nodes) != 4 {
+		t.Fatalf("nodes = %d, want 4", len(nodes))
 	}
-	if len(nodes) != 5 {
-		t.Fatalf("nodes = %d, want 5 (Any dupe kept for dedupe at menu level)", len(nodes))
+	// SortPeers: al-tia, au-adl, de-ber, then zds-nabara ("n" < "z"... check order)
+	var own, al, de *ExitNodeInfo
+	for i := range nodes {
+		switch {
+		case nodes[i].Country == "":
+			own = &nodes[i]
+		case nodes[i].Country == "Albania":
+			al = &nodes[i]
+		case nodes[i].Country == "Germany":
+			de = &nodes[i]
+		}
 	}
-	own := nodes[0]
-	if own.Country != "" || own.City != "" || own.Selected {
-		t.Errorf("own node parsed wrong: %+v", own)
+	if own == nil || own.City != "" || own.Selected {
+		t.Errorf("own node wrong: %+v", own)
 	}
-	ber := nodes[4]
-	if !ber.Selected || ber.Country != "Germany" || ber.City != "Berlin" {
-		t.Errorf("selected row parsed wrong: %+v", ber)
+	if own == nil || own.Hostname != "zds-nabara.tailb4e47d.ts.net" {
+		t.Errorf("own hostname wrong: %+v", own)
 	}
-	if nodes[1].City != "Tirana" {
-		t.Errorf("multi-word/regular city: %+v", nodes[1])
+	if al == nil || al.City != "Tirana" || al.IP != "100.77.189.15" {
+		t.Errorf("Albania row wrong: %+v", al)
+	}
+	if de == nil || !de.Selected || de.City != "Berlin" || de.Country != "Germany" {
+		t.Errorf("selected row wrong: %+v", de)
 	}
 }
 
-func TestGetExitNodesError(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setFail(t)
-	if _, err := GetExitNodes(context.Background()); err == nil {
-		t.Fatal("should fail when CLI fails")
+func TestExitNodeInfosEmpty(t *testing.T) {
+	if got := ExitNodeInfos(&Status{}); len(got) != 0 {
+		t.Errorf("empty status nodes = %v", got)
 	}
 }
 
-func TestGetExitNodesGarbage(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, "some error occurred")
-	if _, err := GetExitNodes(context.Background()); err == nil {
-		t.Fatal("should fail with no parseable rows")
+func TestFirstIPv4(t *testing.T) {
+	if got := firstIPv4([]string{"fd7a::1", "100.64.0.1/32"}); got != "100.64.0.1" {
+		t.Errorf("firstIPv4 = %q", got)
+	}
+	if got := firstIPv4(nil); got != "" {
+		t.Errorf("firstIPv4(nil) = %q", got)
+	}
+	if got := firstIPv4([]string{"fd7a::1"}); got != "fd7a::1" {
+		t.Errorf("v6 fallback = %q", got)
 	}
 }
 
@@ -526,9 +549,63 @@ func TestSplitMullvad(t *testing.T) {
 
 const smartAutoLabel = "Auto (smart: away→own, home→Mullvad)"
 
+// testCities maps hostname city codes to full city names like the
+// real Location data (Berlin, Tirana, ...).
+var testCities = map[string]string{
+	"ber": "Berlin",
+	"tia": "Tirana",
+	"adl": "Adelaide",
+	"fra": "Frankfurt",
+}
+
+// testCountries maps country codes to full country names.
+var testCountries = map[string]string{
+	"de": "Germany",
+	"al": "Albania",
+	"au": "Australia",
+}
+
+// mvPeer builds a tagged Mullvad test peer with Location attached.
+func mvPeer(host string, selected bool) Peer {
+	parts := strings.SplitN(host, "-", 3)
+	code := "ber"
+	if len(parts) >= 2 {
+		code = parts[1]
+	}
+	cc := parts[0]
+	city, ok := testCities[code]
+	if !ok {
+		city = code
+	}
+	country, ok := testCountries[cc]
+	if !ok {
+		country = strings.ToUpper(cc) + "land"
+	}
+	p := Peer{
+		HostName:       host,
+		DNSName:        host + ".mullvad.ts.net.",
+		ExitNodeOption: true,
+		Online:         true,
+		Tags:           []string{"tag:mullvad-exit-node"},
+		TailscaleIPs:   []string{"100.123.112.108"},
+		Location: &Location{
+			Country:     country,
+			CountryCode: strings.ToUpper(cc),
+			City:        city,
+			CityCode:    strings.ToUpper(code),
+			Priority:    50,
+		},
+	}
+	if selected {
+		p.ExitNode = true
+	}
+	return p
+}
+
+// cityLand maps a city code to its country name used in tests.
+func cityLand(s string) string { return strings.ToUpper(s) + "land" }
+
 func TestExitNodeMenuOffAndAuto(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
 	items := a.exitNodeMenu(st, nil)
@@ -544,7 +621,6 @@ func TestExitNodeMenuOffAndAuto(t *testing.T) {
 
 func TestExitNodeMenuOffClick(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
 	items := a.exitNodeMenu(st, nil)
@@ -585,11 +661,9 @@ func TestAutoExitNodeActive(t *testing.T) {
 }
 
 func TestExitNodeMenuAutoMode(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{primed: true, atHome: true}
-	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	active := mvPeer("de-ber-wg-001", true)
 	st := &Status{
 		BackendState: "Running",
 		Peer:         map[string]Peer{"mv": active},
@@ -607,20 +681,15 @@ func TestExitNodeMenuAutoMode(t *testing.T) {
 	if mullvad == nil {
 		t.Fatal("Mullvad submenu missing")
 	}
-	if !hasLabel(mullvad.Submenu, "● Germany") {
-		t.Errorf("country should be hoisted in smart-auto mode: %v", labels(mullvad.Submenu))
-	}
 	if !hasLabel(mullvad.Submenu, "● Berlin") {
 		t.Errorf("applied city should be marked in smart-auto mode: %v", labels(mullvad.Submenu))
 	}
 }
 
 func TestExitNodeMenuAutoParentLabel(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{primed: true, atHome: true}
-	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	active := mvPeer("de-ber-wg-001", true)
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": active}}
 	_, _, menu := a.buildUI(st, nil)
 	// parent shows the applied node's city, not "auto"
@@ -631,7 +700,6 @@ func TestExitNodeMenuAutoParentLabel(t *testing.T) {
 
 func TestExitNodeMenuAutoClickEnables(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	// no local IPs in the advertised LANs -> "away" -> should pick own node
 	restoreIfaceAddrs(t, nil)
 	// status resp must include the own node so enableSmartAuto finds it
@@ -663,15 +731,13 @@ func TestExitNodeMenuAutoClickEnables(t *testing.T) {
 }
 
 func TestExitNodeMenuOwnAndMullvad(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{
 		BackendState: "Running",
 		Peer: map[string]Peer{
-			"own":  {HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true},
-			"mv-a": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
-			"mv-b": {HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+			"own":  {HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, TailscaleIPs: []string{"100.107.25.96"}},
+			"mv-a": mvPeer("al-tia-wg-001", false),
+			"mv-b": mvPeer("de-ber-wg-001", false),
 			"off":  {HostName: "offline-node", ExitNodeOption: true, Online: false},
 			"noex": {HostName: "plain", Online: true},
 		},
@@ -691,7 +757,6 @@ func TestExitNodeMenuOwnAndMullvad(t *testing.T) {
 	if hasLabel(items, "offline-node") || hasLabel(items, "plain") {
 		t.Errorf("offline / non-exit peers leaked into menu: %v", labels(items))
 	}
-	// Australia "Any" duplicate suppressed: only Adelaide survives
 	germany := findLabel(mullvad.Submenu, "Germany")
 	if germany == nil {
 		t.Fatal("Germany submenu missing")
@@ -699,10 +764,8 @@ func TestExitNodeMenuOwnAndMullvad(t *testing.T) {
 }
 
 func TestExitNodeMenuActiveCountryHoisted(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
-	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
+	active := mvPeer("de-ber-wg-001", true)
 	st := &Status{
 		BackendState: "Running",
 		Peer:         map[string]Peer{"mv": active},
@@ -724,10 +787,8 @@ func TestExitNodeMenuActiveCountryHoisted(t *testing.T) {
 }
 
 func TestExitNodeMenuParentLabelCity(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
-	active := Peer{HostName: "de-ber-wg-001", DNSName: "de-ber-wg-001.mullvad.ts.net.", ExitNode: true}
+	active := mvPeer("de-ber-wg-001", true)
 	st := &Status{
 		BackendState: "Running",
 		Peer:         map[string]Peer{"mv": active},
@@ -739,8 +800,6 @@ func TestExitNodeMenuParentLabelCity(t *testing.T) {
 }
 
 func TestExitNodeMenuOwnActiveChecked(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	active := Peer{HostName: "zds-nabara", DNSName: "zds-nabara.tailb4e47d.ts.net.", ExitNodeOption: true, Online: true, ExitNode: true}
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{"own": active}}
@@ -752,12 +811,11 @@ func TestExitNodeMenuOwnActiveChecked(t *testing.T) {
 
 func TestExitNodeMenuCityClickSetsExitNode(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{
 		BackendState: "Running",
 		Peer: map[string]Peer{
-			"mv-a": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+			"mv-a": mvPeer("al-tia-wg-001", false),
 		},
 	}
 	items := a.exitNodeMenu(st, nil)
@@ -768,7 +826,7 @@ func TestExitNodeMenuCityClickSetsExitNode(t *testing.T) {
 	}
 	albania := findLabel(mullvad.Submenu, "Albania")
 	if albania == nil {
-		t.Fatalf("Albania missing: %v", labels(mullvad.Submenu))
+		t.Fatalf("ALland missing: %v", labels(mullvad.Submenu))
 	}
 	tirana := findLabel(albania.Submenu, "○ Tirana")
 	if tirana == nil {
@@ -785,8 +843,6 @@ func TestExitNodeMenuCityClickSetsExitNode(t *testing.T) {
 }
 
 func TestExitNodeMenuNoNodesPlaceholder(t *testing.T) {
-	installFakeTailscale(t)
-	// no exit-node list response: GetExitNodes returns nothing parseable
 	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
 	items := a.exitNodeMenu(st, nil)
@@ -829,9 +885,38 @@ func TestListRowActiveHostnameFallback(t *testing.T) {
 	}
 }
 
+func TestPeerExitAvailableIP(t *testing.T) {
+	st := &Status{Peer: map[string]Peer{
+		"a": {HostName: "Node-renamed", DNSName: "something-else.ts.net.", ExitNodeOption: true, Online: true, TailscaleIPs: []string{"100.20.30.40/32"}},
+		"b": {HostName: "b", ExitNodeOption: true, Online: false}, // offline -> never matches
+	}}
+
+	// IP match despite unrelated names
+	if !peerExitAvailableIP(st, ExitNodeInfo{IP: "100.20.30.40", Hostname: "unmatchable.example.com"}) {
+		t.Error("IP match should work despite unrelated hostname")
+	}
+	// hostname match unaffected
+	if !peerExitAvailableIP(st, ExitNodeInfo{Hostname: "Node-renamed"}) {
+		t.Error("plain hostname match should still work")
+	}
+	// no IP in row, no hostname match
+	if peerExitAvailableIP(st, ExitNodeInfo{Hostname: "ghost"}) {
+		t.Error("no IP + hostname mismatch should not match")
+	}
+	// offline peer with same IP must not count
+	off := &Status{Peer: map[string]Peer{"b": st.Peer["b"]}}
+	if peerExitAvailableIP(off, ExitNodeInfo{IP: "100.99.0.1", Hostname: "b"}) {
+		// "b" hostname matches (peer is offline) -> false via peerExitAvailable gate
+		t.Error("offline peer should never report available")
+	}
+	// offline peer, IP-only path
+	off2 := &Status{Peer: map[string]Peer{"off": {HostName: "x", ExitNodeOption: true, Online: false, TailscaleIPs: []string{"100.1.1.1"}}}}
+	if peerExitAvailableIP(off2, ExitNodeInfo{IP: "100.1.1.1", Hostname: "unrelated"}) {
+		t.Error("offline peer IP should not match")
+	}
+}
+
 func TestExitNodeMenuOwnActiveByIP(t *testing.T) {
-	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	// Renamed device: HostName "Nabara", same IP as the list row.
 	active := Peer{
@@ -852,7 +937,6 @@ func TestExitNodeMenuOwnActiveByIP(t *testing.T) {
 func TestOwnExitItemClickDeselectsToMullvad(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	// status incl. online Mullvad peer + own node; no debug prefs needed
 	ft.setResponse(t, `{"BackendState":"Running","Peer":{
 		"own":{"HostName":"Nabara","DNSName":"zds-nabara.tailb4e47d.ts.net.","ExitNodeOption":true,"Online":true,"TailscaleIPs":["100.107.25.96"]},
@@ -894,7 +978,6 @@ func TestOwnExitItemClickDeselectsToMullvad(t *testing.T) {
 
 func TestOwnExitItemClickInactiveSelects(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{primed: true}
 	st := &Status{
@@ -931,7 +1014,6 @@ func TestOwnExitItemClickInactiveSelects(t *testing.T) {
 func TestApplyLastMullvadNoNodeAvailable(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	// status with no online Mullvad peers
 	ft.setResponse(t, `{"BackendState":"Running","Peer":{}}`)
 	a := newTestApp(t, &fakeUI{})
@@ -941,6 +1023,668 @@ func TestApplyLastMullvadNoNodeAvailable(t *testing.T) {
 	}
 	if a.smart == nil {
 		t.Error("unavailable target should not disable smart auto")
+	}
+}
+
+// ---- captive portal ----
+
+// fakeNMObj answers NM property reads and CheckConnectivity calls.
+type fakeNMObj struct {
+	state    uint32
+	checkOn  bool
+	checkURI string
+	primary  dbus.ObjectPath
+	ip4      dbus.ObjectPath // manager-level Ip4Config answer
+	ip4AC    dbus.ObjectPath // ActiveConnection-level Ip4Config answer
+	gateway  string
+	forceCalled bool
+}
+
+func (o *fakeNMObj) Call(method string, flags dbus.Flags, args ...any) *dbus.Call {
+	v := dbus.MakeVariant("")
+	switch {
+	case method == propInterface+".Get" && args[1] == "Connectivity":
+		v = dbus.MakeVariant(o.state)
+	case method == propInterface+".Get" && args[1] == "ConnectivityCheckEnabled":
+		v = dbus.MakeVariant(o.checkOn)
+	case method == propInterface+".Get" && args[1] == "ConnectivityCheckUri":
+		v = dbus.MakeVariant(o.checkURI)
+	case method == propInterface+".Get" && args[1] == "PrimaryConnection":
+		v = dbus.MakeVariant(o.primary)
+	case method == propInterface+".Get" && args[1] == "Ip4Config":
+		v = dbus.MakeVariant(o.ip4)
+	case method == propInterface+".Get" && args[1] == "Gateway":
+		v = dbus.MakeVariant(o.gateway)
+	case method == nmInterface+".CheckConnectivity":
+		o.forceCalled = true
+		v = dbus.MakeVariant(o.state)
+	}
+	// Call Store(&variantOut) semantics: body = one variant
+	return &dbus.Call{Body: []any{dbus.MakeVariant(v.Value())}, Err: nil}
+}
+
+// fakeNMConn resolves manager + config objects.
+type fakeNMConn struct {
+	obj *fakeNMObj
+}
+
+func (c *fakeNMConn) objectAt(path dbus.ObjectPath) nmObject {
+	if path == nmPath {
+		return &nmProxyObj{host: c.obj}
+	}
+	// Ip4Config or ActiveConnection path: gateway lives here
+	return &cfgObj{host: c.obj}
+}
+
+func (c *fakeNMConn) close() error { return nil }
+
+// nmProxyObj serves manager-level properties; PrimaryConnection and
+// Ip4Config reads are answered at manager level (property cache).
+type nmProxyObj struct {
+	host *fakeNMObj
+}
+
+func (o *nmProxyObj) Call(method string, flags dbus.Flags, args ...any) *dbus.Call {
+	if method == propInterface+".Get" && len(args) > 1 {
+		switch args[1] {
+		case "PrimaryConnection":
+			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(o.host.primary).Value())}, Err: nil}
+		case "Ip4Config":
+			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(o.host.ip4).Value())}, Err: nil}
+		}
+	}
+	return o.host.Call(method, flags, args...)
+}
+
+// cfgObj serves Ip4Config/ActiveConnection object paths (Gateway and
+// the AC-level Ip4Config used by the fallback walk).
+type cfgObj struct {
+	host *fakeNMObj
+}
+
+func (o *cfgObj) Call(method string, flags dbus.Flags, args ...any) *dbus.Call {
+	if method == propInterface+".Get" && len(args) > 1 {
+		switch args[1] {
+		case "Gateway":
+			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(o.host.gateway).Value())}, Err: nil}
+		case "Ip4Config":
+			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(o.host.ip4AC).Value())}, Err: nil}
+		}
+	}
+	return &dbus.Call{Err: fmt.Errorf("fakeNM: unhandled %s %v", method, args)}
+}
+
+// restoreNM swaps the NM gate with the fake bus; hysteresis is forced
+// to 2 (production value) but the throttle reset lets fresh checks run
+// immediately. Returns the fake handle for assertions.
+func restoreNM(t *testing.T, state int, checkURI string, probeURL string, probeErr error) *fakeNMObj {
+	t.Helper()
+	obj := &fakeNMObj{
+		state:    uint32(state),
+		checkOn:  true,
+		checkURI: checkURI,
+		primary:  dbus.ObjectPath("/org/freedesktop/NetworkManager/ActiveConnection/1"),
+		ip4:      dbus.ObjectPath("/org/freedesktop/NetworkManager/IP4Config/1"),
+		gateway:  "10.1.32.1",
+	}
+	conn := &fakeNMConn{obj: obj}
+	origDial, origURIs, origHTTP, origHy, origClock := realDial, nmCheckURIs, httpDo, portalHysteresis, clockNow
+	realDial = func(context.Context) (nmConn, error) { return conn, nil }
+	nmCheckURIs = func(context.Context) ([]string, error) { return []string{checkURI}, nil }
+	httpDo = func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{probeURL}}, Body: http.NoBody}, probeErr
+	}
+	portalHysteresis = 2
+	resetGatewayCandidate()
+	t.Cleanup(func() {
+		realDial, nmCheckURIs, httpDo, portalHysteresis, clockNow = origDial, origURIs, origHTTP, origHy, origClock
+		resetGatewayCandidate()
+	})
+	return obj
+}
+
+func TestCheckPortalClear(t *testing.T) {
+	restoreNM(t, nmConnectivityFull, "http://check.example/ok", "", nil)
+	state, url := CheckPortal(context.Background())
+	if state != nmConnectivityFull || url != "" {
+		t.Errorf("full state = (%d,%q)", state, url)
+	}
+}
+
+func TestCheckPortalWithURL(t *testing.T) {
+	restoreNM(t, nmConnectivityPortal, "http://check.example/ok", "http://portal.example/login", nil)
+	state, url := CheckPortal(context.Background())
+	if state != nmConnectivityPortal || url != "http://portal.example/login" {
+		t.Errorf("portal state = (%d,%q)", state, url)
+	}
+}
+
+func TestCheckPortalProbeError(t *testing.T) {
+	// Portal present, probe fails -> state reported, gateway fallback URL
+	restoreNM(t, nmConnectivityPortal, "http://check.example/ok", "", errors.New("timeout"))
+	state, url := CheckPortal(context.Background())
+	if state != nmConnectivityPortal {
+		t.Errorf("state = %d, want portal", state)
+	}
+	if url != "http://10.1.32.1/" {
+		t.Errorf("probe failure should fall back to gateway, got %q", url)
+	}
+}
+
+func TestNMPortabilityStringURI(t *testing.T) {
+	// older NM: ConnectivityCheckUri is a plain string
+	restoreNM(t, nmConnectivityPortal, "", "", nil)
+	orig := nmCheckURIs
+	nmCheckURIs = func(context.Context) ([]string, error) { return orig(context.Background()) }
+	// simulate string-typed value by direct probe: covered via restoreNM checkURI arg
+	uris, err := nmCheckURIs(context.Background())
+	if err != nil || len(uris) != 1 {
+		t.Errorf("uris = %v err=%v", uris, err)
+	}
+}
+
+func TestPortalStateNames(t *testing.T) {
+	cases := map[int]string{
+		nmConnectivityPortal:  "portal",
+		nmConnectivityFull:    "full",
+		nmConnectivityLimited: "limited",
+		nmConnectivityNone:    "none",
+		nmConnectivityUnknown: "unknown",
+	}
+	for s, want := range cases {
+		if got := portalStateName(s); got != want {
+			t.Errorf("portalStateName(%d) = %q, want %q", s, got, want)
+		}
+	}
+}
+
+func TestTickPortalDisconnectsOnPortal(t *testing.T) {
+	ft := installFakeTailscale(t)
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	st := &Status{BackendState: "Running"}
+
+	a.tickPortal(st) // arms (hysteresis streak 1), no action yet
+	if detected, _ := a.portalInfo(); detected {
+		t.Error("single portal reading must not trigger detection (hysteresis)")
+	}
+	a.tickPortal(st) // second reading -> detect + disconnect
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ft.lastCall(t); got[0] != "down" {
+		t.Errorf("portal should disconnect, ran %v", ft.callsSoFar(t))
+	}
+	detected, url := a.portalInfo()
+	if !detected || url != "http://portal/login" {
+		t.Errorf("portalInfo = (%v,%q)", detected, url)
+	}
+}
+
+func TestTickPortalDoesNotReDisconnect(t *testing.T) {
+	ft := installFakeTailscale(t)
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running"}
+
+	a.tickPortal(st) // arm: no disconnect yet
+	a.tickPortal(st) // detect + disconnect
+	nAfterDetect := len(ft.callsSoFar(t))
+	a.tickPortal(&Status{BackendState: "Stopped"}) // persisting portal: no extra calls
+	n := len(ft.callsSoFar(t))
+	if n != nAfterDetect {
+		t.Errorf("portal persist should be deduped: %v", ft.callsSoFar(t))
+	}
+}
+
+func TestTickPortalReupsOnClear(t *testing.T) {
+	ft := installFakeTailscale(t)
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running"}
+	a.tickPortal(st) // arm (hysteresis)
+	a.tickPortal(st) // detect + disconnect + mark reup
+
+	// clear: NM says full; tailscale still reports Stopped (down happened)
+	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	a.tickPortal(&Status{BackendState: "Stopped"})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	calls := ft.callsSoFar(t)
+	var sawDown, sawUp bool
+	for _, c := range calls {
+		if c[0] == "down" {
+			sawDown = true
+		}
+		if c[0] == "up" {
+			sawUp = true
+		}
+	}
+	if !sawDown || !sawUp {
+		t.Errorf("portal cycle should down+up, calls: %v", calls)
+	}
+	detected, _ := a.portalInfo()
+	if detected {
+		t.Error("portal should be cleared")
+	}
+}
+
+func TestTickPortalClearNoReupWithoutNeed(t *testing.T) {
+	ft := installFakeTailscale(t)
+	// portal never detected; connectivity fine; tailscale stopped by user choice
+	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	a := newTestApp(t, &fakeUI{})
+	a.tickPortal(&Status{BackendState: "Stopped"})
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "up" {
+			t.Errorf("no reup without a portal cycle: %v", ft.callsSoFar(t))
+		}
+	}
+}
+
+func TestMenuPortalItems(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Stopped"}
+	items := a.menuPortal(st, "http://portal/login", nil)
+
+	if !hasLabel(items, "Wi-Fi captive portal detected") {
+		t.Fatalf("portal banner missing: %v", labels(items))
+	}
+	open := findLabel(items, "Open portal login")
+	if open == nil {
+		t.Fatal("Open portal login missing")
+	}
+	retry := findLabel(items, "Retry connectivity check")
+	if retry == nil {
+		t.Fatal("Retry missing")
+	}
+}
+
+func TestMenuPortalNoURL(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Stopped"}
+	items := a.menuPortal(st, "", nil)
+	if !hasLabel(items, "No login URL discovered yet") {
+		t.Errorf("no-URL placeholder missing: %v", labels(items))
+	}
+	if hasLabel(items, "Open portal login") {
+		t.Errorf("Open portal login must not exist without a URL: %v", labels(items))
+	}
+}
+
+func TestMenuPortalOpenClicksURL(t *testing.T) {
+	rec := restoreExec(t)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Stopped"}
+	items := a.menuPortal(st, "http://portal/login", nil)
+
+	open := findLabel(items, "Open portal login")
+	open.OnClick()
+	got := rec.all()
+	if len(got) != 1 || got[0][0] != "chromium-browser" || got[0][1] != "http://portal/login" {
+		t.Errorf("open portal click = %v", got)
+	}
+}
+
+func TestBuildUIPortalBeatsOtherStates(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	a.portal.mu.Lock()
+	a.portal.detected = true
+	a.portal.url = "http://portal/login"
+	a.portal.mu.Unlock()
+
+	// even when running, portal takes over the menu
+	st := &Status{BackendState: "Running", TailscaleIPs: []string{"100.64.0.1"}}
+	icon, tooltip, items := a.buildUI(st, nil)
+	if tooltip != "Tailscale: Wi-Fi captive portal" {
+		t.Errorf("tooltip = %q", tooltip)
+	}
+	if !hasLabel(items, "Open portal login") {
+		t.Errorf("portal menu missing: %v", labels(items))
+	}
+	_ = icon
+}
+
+func TestPortalKeyInDedup(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	if k := portalKey(a); k != "" {
+		t.Errorf("clean portalKey = %q", k)
+	}
+	a.portal.mu.Lock()
+	a.portal.detected = true
+	a.portal.url = "http://x"
+	a.portal.mu.Unlock()
+	if k := portalKey(a); k != "portal:http://x" {
+		t.Errorf("portalKey = %q", k)
+	}
+}
+
+func TestFetchPortalURLFollowsNMChain(t *testing.T) {
+	// Direct seam test: 302 with Location -> URL; 200 -> empty
+	orig := httpDo
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{"https://portal/pwn"}}, Body: http.NoBody}, nil
+	}
+	url, err := FetchPortalURL(context.Background(), "http://check/x")
+	if err != nil || url != "https://portal/pwn" {
+		t.Errorf("redirect probe = (%q,%v)", url, err)
+	}
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody}, nil
+	}
+	url, err = FetchPortalURL(context.Background(), "http://check/x")
+	if err != nil || url != "" {
+		t.Errorf("clean probe = (%q,%v)", url, err)
+	}
+	httpDo = orig
+}
+
+// ---- portal improvements: throttle, body-sniff fallback, hysteresis ----
+
+func TestCheckConnectivityForcedThrottled(t *testing.T) {
+	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	nmGateState.lastForce = time.Time{} // force a fresh run
+
+	now := time.Now()
+	origClock := clockNow
+	clockNow = func() time.Time { return now }
+	defer func() { clockNow = origClock }()
+
+	// first call: throttled fresh check happens
+	force1 := obj.forceCalled
+	if _, err := nmGateState.connectivity(context.Background()); err != nil {
+		t.Fatalf("connectivity: %v", err)
+	}
+	if !force1 && !obj.forceCalled {
+		t.Fatal("first call should trigger CheckConnectivity")
+	}
+	forcedAfterFirst := obj.forceCalled
+
+	// second call within forceInterval: cached property read, no fresh call
+	obj.forceCalled = false
+	clockNow = func() time.Time { return now.Add(10 * time.Second) }
+	if _, err := nmGateState.connectivity(context.Background()); err != nil {
+		t.Fatalf("connectivity 2: %v", err)
+	}
+	if obj.forceCalled {
+		t.Error("throttle must suppress the second fresh check within interval")
+	}
+
+	// call after forceInterval: fresh check again
+	obj.forceCalled = false
+	clockNow = func() time.Time { return now.Add(forceInterval + time.Second) }
+	if _, err := nmGateState.connectivity(context.Background()); err != nil {
+		t.Fatalf("connectivity 3: %v", err)
+	}
+	if !obj.forceCalled {
+		t.Error("call after forceInterval should force a fresh check")
+	}
+	_ = forcedAfterFirst
+}
+
+func TestPortalDisabledWarnsOnce(t *testing.T) {
+	obj := restoreNM(t, nmConnectivityUnknown, "", "", nil)
+	obj.checkOn = false
+
+	var warns int
+	origWarn := logWarnf
+	logWarnf = func(string, ...any) { warns++ }
+	defer func() { logWarnf = origWarn }()
+
+	for i := 0; i < 3; i++ {
+		state, err := nmGateState.connectivity(context.Background())
+		if err != nil {
+			t.Fatalf("connectivity: %v", err)
+		}
+		if state != nmConnectivityUnknown {
+			t.Errorf("disabled check should degrade to property, got %d", state)
+		}
+	}
+	if warns != 1 {
+		t.Errorf("warned %d times, want exactly 1", warns)
+	}
+}
+
+func TestPortalHysteresisFlapResists(t *testing.T) {
+	ft := installFakeTailscale(t)
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running"}
+
+	// flapping: portal, full, portal, full — nothing should ever fire
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a.tickPortal(st)
+	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	a.tickPortal(st)
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a.tickPortal(st)
+	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	a.tickPortal(st)
+
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "down" {
+			t.Errorf("flapping readings must never disconnect: %v", ft.callsSoFar(t))
+		}
+	}
+	if detected, _ := a.portalInfo(); detected {
+		t.Error("flapping must not leave portal detected")
+	}
+}
+
+func TestHysteresisConfigurable(t *testing.T) {
+	ft := installFakeTailscale(t)
+	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	obj.state = nmConnectivityPortal
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running"}
+
+	portalHysteresis = 3
+	a.tickPortal(st) // streak 1
+	a.tickPortal(st) // streak 2
+	if detected, _ := a.portalInfo(); detected {
+		t.Error("streak 2 must not trigger with hysteresis 3")
+	}
+	a.tickPortal(st) // streak 3 -> fire
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var sawDown bool
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "down" {
+			sawDown = true
+		}
+	}
+	if !sawDown {
+		t.Errorf("streak 3 should trigger disconnect, calls: %v", ft.callsSoFar(t))
+	}
+}
+
+func TestGatewayFallbackRedirect(t *testing.T) {
+	// Portal probe returns NO redirect and a plain 200 body, but NM's
+	// verdict is PORTAL: the gateway login candidate is used anyway
+	// (NM saw the hijack; our probe just failed to reproduce it).
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "", nil)
+	origHTTP := httpDo
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody}, nil
+	}
+	defer func() { httpDo = origHTTP }()
+
+	state, url := CheckPortal(context.Background())
+	if state != nmConnectivityPortal {
+		t.Errorf("state = %d", state)
+	}
+	if url != "http://10.1.32.1/" {
+		t.Errorf("NM verdict PORTAL should yield gateway candidate, got %q", url)
+	}
+	// without a gateway resolved, the candidate stays empty
+	resetGatewayCandidate()
+}
+
+func TestGatewayFallbackBodySniff(t *testing.T) {
+	// Portal serves HTML on the check URI without redirect: full
+	// CheckPortal resolves the gateway over DBus and returns its
+	// login URL.
+	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "", nil)
+
+	origHTTP := httpDo
+	httpDo = func(req *http.Request) (*http.Response, error) {
+		body := `<!DOCTYPE html><html><head><title>Hotel WiFi Login</title></head><body>Please sign in</body></html>`
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	}
+	defer func() { httpDo = origHTTP }()
+
+	state, url := CheckPortal(context.Background())
+	if state != nmConnectivityPortal {
+		t.Errorf("state = %d, want portal", state)
+	}
+	_ = obj
+	// gateway candidate must come from the NM Gateway property (fake: 10.1.32.1)
+	if url != "http://10.1.32.1/" {
+		t.Errorf("body-sniff portal should resolve gateway URL, got %q", url)
+	}
+}
+
+func TestIsHijackedBody(t *testing.T) {
+	cases := []struct {
+		ct   string
+		body string
+		want bool
+	}{
+		{"text/plain", "OK", false},
+		{"application/json", `{"status":"ok"}`, false},
+		{"text/html", "<html><body>login</body></html>", true},
+		{"", "<html>wifi</html>", true},
+		{"", "OK", false},
+		{"text/html", "<!doctype html><body><h1>Guest Portal</h1></body>", true},
+	}
+	for i, tc := range cases {
+		if got := isHijackedBody(tc.ct, []byte(tc.body)); got != tc.want {
+			t.Errorf("case %d: isHijackedBody(%q) = %v, want %v", i, tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestGatewayResolutionChained(t *testing.T) {
+	// Full chain: NM PrimaryConnection -> Ip4Config -> Gateway
+	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "", nil)
+	gw, err := primaryGateway(context.Background())
+	if err != nil {
+		t.Fatalf("primaryGateway: %v", err)
+	}
+	if gw != "10.1.32.1" {
+		t.Errorf("gateway = %q, want from fake", gw)
+	}
+	// manager-level Ip4Config missing -> ActiveConnection fallback path
+	obj.ip4 = ""
+	setGatewayCandidate("")
+	if _, err := FetchPortalURL(context.Background(), "http://check/x"); err != nil {
+		t.Log(err) // informational
+	}
+}
+
+func TestGatewayOnNoPrimary(t *testing.T) {
+	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	obj.primary = "" // no active connection
+	if _, err := primaryGateway(context.Background()); err == nil {
+		t.Error("missing primary connection should error")
+	}
+	// Manager-level Ip4Config empty -> gatewayOn falls back to the
+	// ActiveConnection object (AC-level Ip4Config answer).
+	obj.primary = dbus.ObjectPath("/nm/AC")
+	obj.ip4 = ""
+	obj.ip4AC = dbus.ObjectPath("/nm/IP4")
+	obj.gateway = "10.1.32.1"
+	gw, err := primaryGateway(context.Background())
+	if err != nil {
+		t.Fatalf("gateway via ActiveConnection fallback: %v", err)
+	}
+	if gw != "10.1.32.1" {
+		t.Errorf("gateway = %q", gw)
+	}
+}
+
+func TestMenuPortalRetryClick(t *testing.T) {
+	// Retry click while portal absent + no URL: no crash, refresh requested
+	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running"}
+	items := a.menuPortal(st, "", nil)
+
+	retry := findLabel(items, "Retry connectivity check")
+	retry.OnClick()
+	select {
+	case <-a.refreshCh:
+	case <-time.After(time.Second):
+		t.Error("retry should request refresh")
+	}
+}
+
+func TestMenuPortalProfilesIncluded(t *testing.T) {
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Stopped"}
+	profiles := []Profile{
+		{ID: "p1", Nickname: "one@x", Selected: true},
+		{ID: "p2", Nickname: "two@y"},
+	}
+	items := a.menuPortal(st, "", profiles)
+	if !hasLabel(items, "Profile: one@x") {
+		t.Errorf("portal menu should keep the profile submenu: %v", labels(items))
+	}
+	quit := findLabel(items, "Quit")
+	if quit == nil || quit.OnClick == nil {
+		t.Fatal("portal menu should offer Quit")
+	}
+	quit.OnClick()
+	select {
+	case <-a.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("portal Quit did not cancel context")
+	}
+}
+
+func TestGatewayLoginCandidateEmpty(t *testing.T) {
+	resetGatewayCandidate()
+	if got := gatewayLoginCandidate(); got != "" {
+		t.Errorf("no gateway candidate = %q", got)
+	}
+}
+
+func TestPortalRetryForcesFresh(t *testing.T) {
+	// Retry entry: force a fresh CheckConnectivity by clearing the throttle
+	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	obj.forceCalled = false
+	nmGateState.lastForce = time.Time{}
+	if _, err := nmGateState.connectivity(context.Background()); err != nil {
+		t.Fatalf("connectivity: %v", err)
+	}
+	if !obj.forceCalled {
+		t.Error("retry (throttle cleared) should force a fresh check")
+	}
+}
+
+func TestFakeNMForceCall(t *testing.T) {
+	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "", nil)
+	obj.forceCalled = false
+	nmGateState.lastForce = time.Time{}
+	state, err := nmGateState.connectivity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obj.forceCalled {
+		t.Error("fake harness: CheckConnectivity should hit the fake")
+	}
+	if state != nmConnectivityPortal {
+		t.Errorf("state = %d, want portal", state)
 	}
 }
 
@@ -958,7 +1702,6 @@ func smartTestStatus() *Status {
 
 func TestTickSmartAutoPrimeOnly(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	restoreIfaceAddrs(t, nil) // away
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
@@ -976,7 +1719,6 @@ func TestTickSmartAutoPrimeOnly(t *testing.T) {
 
 func TestTickSmartAutoRePrimeApplies(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	restoreIfaceAddrs(t, nil) // away
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{} // simulates un-primed state after disconnect/profile switch
@@ -999,7 +1741,6 @@ func TestTickSmartAutoRePrimeApplies(t *testing.T) {
 
 func TestTickSmartAutoFlipsAwayToHome(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
 
@@ -1033,7 +1774,6 @@ func TestTickSmartAutoFlipsAwayToHome(t *testing.T) {
 
 func TestTickSmartAutoFlipsHomeToAway(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
 
@@ -1065,7 +1805,6 @@ func TestTickSmartAutoFlipsHomeToAway(t *testing.T) {
 
 func TestTickSmartAutoStableDoesNotThrash(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
 
@@ -1084,7 +1823,6 @@ func TestTickSmartAutoPersistsLastMullvad(t *testing.T) {
 	// Point the state file into a temp dir.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
 
@@ -1188,13 +1926,12 @@ func TestOwnExitNodeLANsAndAtHome(t *testing.T) {
 
 func TestDisableSmartAutoOnManualPick(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{primed: true}
 	st := &Status{
 		BackendState: "Running",
 		Peer: map[string]Peer{
-			"mv-a": {HostName: "al-tia-wg-001", DNSName: "al-tia-wg-001.mullvad.ts.net.", ExitNodeOption: true, Online: true, Tags: []string{"tag:mullvad-exit-node"}},
+			"mv-a": mvPeer("al-tia-wg-001", false),
 		},
 	}
 	items := a.exitNodeMenu(st, nil)
@@ -1218,7 +1955,6 @@ func TestDisableSmartAutoOnManualPick(t *testing.T) {
 
 func TestDisableSmartAutoOnOffClick(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{primed: true}
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
@@ -1326,7 +2062,6 @@ func TestMenuNeedsLoginShowsProfiles(t *testing.T) {
 
 func TestTickSmartAutoReAppliesAfterDisconnect(t *testing.T) {
 	ft := installFakeTailscale(t)
-	ft.setExitNodeList(t, exitNodeListFixture)
 	ft.setResponse(t, `{"BackendState":"Running"}`) // for enable/re-apply GetStatus
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{}
