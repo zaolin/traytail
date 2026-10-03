@@ -57,16 +57,25 @@ type Profile struct {
 
 func run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "tailscale", args...)
-	var out strings.Builder
+	var out, errOut strings.Builder
 	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.Stderr = &errOut
 	err := cmd.Run()
-	return out.String(), err
+	if err != nil {
+		// errors carry stderr (CLI messages); callers show it
+		return strings.TrimSpace(errOut.String()), fmt.Errorf("tailscale %v: %w", args, err)
+	}
+	// stdout only: the CLI prints "Warning: client version ..." lines to
+	// stderr during version mismatches, which used to poison JSON parses.
+	return out.String(), nil
 }
 
 func GetStatus(ctx context.Context) (*Status, error) {
 	out, err := run(ctx, "status", "--json")
 	if err != nil {
+		if out != "" {
+			return nil, fmt.Errorf("tailscale status: %v: %w", out, err)
+		}
 		return nil, fmt.Errorf("tailscale status: %w", err)
 	}
 	var st Status
@@ -79,6 +88,9 @@ func GetStatus(ctx context.Context) (*Status, error) {
 func GetProfiles(ctx context.Context) ([]Profile, error) {
 	out, err := run(ctx, "switch", "--list", "--json")
 	if err != nil {
+		if out != "" {
+			return nil, fmt.Errorf("tailscale switch --list: %v: %w", out, err)
+		}
 		return nil, fmt.Errorf("tailscale switch --list: %w", err)
 	}
 	var ps []Profile

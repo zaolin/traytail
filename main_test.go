@@ -8,9 +8,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -85,6 +88,8 @@ func newTestApp(t *testing.T, ui trayUI) *app {
 	t.Helper()
 	ctx, stop := context.WithCancel(context.Background())
 	t.Cleanup(stop)
+	// Portal seams are stubbed once in TestMain; tests exercising the
+	// machinery swap everything via restoreNM.
 	return &app{ctx: ctx, stop: stop, sni: ui, refreshCh: make(chan struct{}, 1)}
 }
 
@@ -1026,17 +1031,304 @@ func TestApplyLastMullvadNoNodeAvailable(t *testing.T) {
 	}
 }
 
+// ---- CLI stderr separation + tunnel-bypass probe ----
+
+func TestRunSeparatesStderrFromJSON(t *testing.T) {
+	ft := installFakeTailscale(t)
+	// make the fake print a warning to BOTH stderr and stdout before JSON
+	bin := filepath.Join(ft.dir, "bin", "tailscale")
+	script := "#!/bin/sh\necho \"Warning: client version \\\"1.102.5\\\" != tailscaled version \\\"1.102.4\\\"\" >&2\ncat " + filepath.Join(ft.dir, "resp.txt") + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ft.setResponse(t, `{"BackendState":"Running"}`)
+
+	st, err := GetStatus(context.Background())
+	if err != nil {
+		t.Fatalf("warning line must not break JSON parse: %v", err)
+	}
+	if st.BackendState != "Running" {
+		t.Errorf("state = %q", st.BackendState)
+	}
+}
+
+func TestRunErrorCarriesStderr(t *testing.T) {
+	ft := installFakeTailscale(t)
+	ft.setFail(t)
+	_, err := GetStatus(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "simulated cli failure") {
+		t.Errorf("error should carry stderr text: %v", err)
+	}
+}
+
+func restoreSelfProbe(t *testing.T, bindIP string, fn func(req *http.Request) (*http.Response, error)) {
+	t.Helper()
+	origBind := interfaceAddrs
+	interfaceAddrs = func() ([]net.Addr, error) {
+		ip := net.ParseIP(bindIP)
+		return []net.Addr{&net.IPNet{IP: ip, Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	orig := probeHTTPDo
+	probeHTTPDo = func(d *net.Dialer, req *http.Request) (*http.Response, error) { return fn(req) }
+	t.Cleanup(func() { interfaceAddrs = origBind; probeHTTPDo = orig })
+}
+
+func respWith(status int, location string, contentType, body string) *http.Response {
+	h := http.Header{}
+	if location != "" {
+		h.Set("Location", location)
+	}
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	return &http.Response{StatusCode: status, Header: h, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func TestSelfCheckPortalRedirect(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(302, "http://portal.example/login", "", ""), nil
+	})
+	ok, url := selfCheckPortal(context.Background(), "172.24.7.111", "http://check/x", "10.1.32.1")
+	if !ok || url != "http://portal.example/login" {
+		t.Errorf("redirect portal = (%v,%q)", ok, url)
+	}
+}
+
+func TestSelfCheckPortalHTMLBody(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(200, "", "text/html", "<html>wifi login</html>"), nil
+	})
+	ok, url := selfCheckPortal(context.Background(), "172.24.7.111", "http://check/x", "10.1.32.1")
+	if !ok || url != "http://10.1.32.1/" {
+		t.Errorf("html portal = (%v,%q), want gateway URL", ok, url)
+	}
+}
+
+func TestSelfCheckPortalClean(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(204, "", "", ""), nil
+	})
+	ok, url := selfCheckPortal(context.Background(), "172.24.7.111", "http://check/x", "10.1.32.1")
+	if ok || url != "" {
+		t.Errorf("clean check = (%v,%q), want no portal", ok, url)
+	}
+}
+
+func TestSelfCheckPortalDialError(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network unreachable")
+	})
+	ok, _ := selfCheckPortal(context.Background(), "172.24.7.111", "http://check/x", "10.1.32.1")
+	if ok {
+		t.Error("dial error should not claim portal")
+	}
+}
+
+func TestSelfProbeDialerMarksAndBinds(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(204, "", "", ""), nil
+	})
+	d := selfProbeDialer("172.24.7.111", true)
+	ta, ok := d.LocalAddr.(*net.TCPAddr)
+	if !ok || ta.IP.String() != "172.24.7.111" {
+		t.Errorf("dialer should bind to the wifi IP, got %v", d.LocalAddr)
+	}
+	if d.Control == nil {
+		t.Fatal("dialer should carry the fwmark Control")
+	}
+	// Exercise the Control body with a real file descriptor's RawConn:
+	// unprivileged SO_MARK fails EPERM -> falls back silently (no panic).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if rc, ok := conn.(syscall.Conn); ok {
+		raw, _ := rc.SyscallConn()
+		d.Control("tcp4", ln.Addr().String(), raw)
+		// mark disabled -> Control is a no-op (still present)
+		d2 := selfProbeDialer("1.2.3.4", false)
+		if d2.Control == nil {
+			t.Error("Control hook should always exist")
+		}
+		d2.Control("tcp4", ln.Addr().String(), raw)
+	}
+}
+
+func TestBindIPFor(t *testing.T) {
+	restoreIfaceAddrs(t, []string{"169.254.3.3/16", "192.168.40.7/24"})
+	if got := bindIPFor(); got != "192.168.40.7" {
+		t.Errorf("bindIPFor should pick the global v4 addr, got %q", got)
+	}
+	// only tailscale CGNAT present -> empty
+	restoreIfaceAddrs(t, []string{"100.64.0.9/10"})
+	if got := bindIPFor(); got != "" {
+		t.Errorf("tailscale IP must be skipped, got %q", got)
+	}
+}
+
+func TestPortalNMAuthoritative(t *testing.T) {
+	resetCheckEnabledCache()
+	defer resetCheckEnabledCache()
+	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	defer func() { obj.forceCalled = false }()
+
+	// no exit node + check enabled -> NM authoritative
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
+	if !portalNMAuthoritative(st) {
+		t.Error("plain connection: NM should be authoritative")
+	}
+	// exit node active -> not authoritative (tunnel swallows probes)
+	stN := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}}
+	if portalNMAuthoritative(stN) {
+		t.Error("with exit node: NM verdict unreliable")
+	}
+}
+
+func TestTickPortalSelfProbeDetectsThroughTunnel(t *testing.T) {
+	ft := installFakeTailscale(t)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{primed: true}
+	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	_ = obj
+	// disable NM check -> self-probe must take over
+	obj.checkOn = false
+
+	// self-probe sees a redirect (the actual portal)
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(302, "http://portal/login", "", ""), nil
+	})
+
+	st := &Status{
+		BackendState: "Running",
+		Peer:         map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}, // tunnel active
+	}
+
+	a.tickPortal(st) // arm (hysteresis)
+	a.tickPortal(st) // fire: disconnect
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var sawDown bool
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "down" {
+			sawDown = true
+		}
+	}
+	if !sawDown {
+		t.Errorf("self-probe detection should disconnect despite tunnel, calls: %v", ft.callsSoFar(t))
+	}
+	detected, url := a.portalInfo()
+	if !detected || url != "http://portal/login" {
+		t.Errorf("portalInfo = (%v,%q)", detected, url)
+	}
+}
+
+func TestTickPortalSelfProbeClearReups(t *testing.T) {
+	ft := installFakeTailscale(t)
+	a := newTestApp(t, &fakeUI{})
+	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	obj.checkOn = false // self-probe mode
+
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}}
+
+	// detect through the tunnel
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(302, "http://portal/login", "", ""), nil
+	})
+	a.tickPortal(st)
+	a.tickPortal(st)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// portal gone: self-probe clean; tailscale reports Stopped (was downed)
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(204, "", "", ""), nil
+	})
+	a.tickPortal(&Status{BackendState: "Stopped"})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var sawUp bool
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "up" {
+			sawUp = true
+		}
+	}
+	if !sawUp {
+		t.Errorf("cleared self-probe should re-up, calls: %v", ft.callsSoFar(t))
+	}
+}
+
+func TestTickSmartAutoAwayFallsBackToMullvad(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ft := installFakeTailscale(t)
+	ft.setResponse(t, `{"BackendState":"Running"}`)
+	a := newTestApp(t, &fakeUI{})
+	a.smart = &smartAuto{}
+
+	// away, but NO own exit node peer at all: only Mullvad online
+	restoreIfaceAddrs(t, nil)
+	st := &Status{
+		BackendState: "Running",
+		Peer: map[string]Peer{
+			"mv": mvPeer("de-ber-wg-001", false),
+		},
+	}
+	a.tickSmartAuto(st) // primes away: no apply
+
+	// force flip detection: prime home first, then away
+	a2 := newTestApp(t, &fakeUI{})
+	a2.smart = &smartAuto{}
+	restoreIfaceAddrs(t, []string{"192.168.178.35/24"})
+	stHome := &Status{
+		BackendState: "Running",
+		Peer:         map[string]Peer{"mv": mvPeer("de-ber-wg-001", false), "own": {}},
+	}
+	// own peer present but Offline -> away-flip must fall back to Mullvad
+	stHome.Peer["own"] = Peer{HostName: "ownnode", ExitNodeOption: true, Online: false, PrimaryRoutes: []string{"192.168.178.0/24"}}
+	a2.tickSmartAuto(stHome) // prime (home)
+	restoreIfaceAddrs(t, nil)
+	a2.tickSmartAuto(stHome) // flip -> away, own offline -> Mullvad fallback
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	var setCall []string
+	for _, c := range ft.callsSoFar(t) {
+		if c[0] == "set" {
+			setCall = c
+		}
+	}
+	if setCall == nil || setCall[1] != "--exit-node=de-ber-wg-001" {
+		t.Errorf("away with no own node should apply last/first Mullvad, ran %v", ft.callsSoFar(t))
+	}
+}
+
 // ---- captive portal ----
 
 // fakeNMObj answers NM property reads and CheckConnectivity calls.
 type fakeNMObj struct {
-	state    uint32
-	checkOn  bool
-	checkURI string
-	primary  dbus.ObjectPath
-	ip4      dbus.ObjectPath // manager-level Ip4Config answer
-	ip4AC    dbus.ObjectPath // ActiveConnection-level Ip4Config answer
-	gateway  string
+	state       uint32
+	checkOn     bool
+	checkURI    string
+	primary     dbus.ObjectPath
+	ip4         dbus.ObjectPath // manager-level Ip4Config answer
+	ip4AC       dbus.ObjectPath // ActiveConnection-level Ip4Config answer
+	gateway     string
 	forceCalled bool
 }
 
@@ -1119,6 +1411,13 @@ func (o *cfgObj) Call(method string, flags dbus.Flags, args ...any) *dbus.Call {
 // immediately. Returns the fake handle for assertions.
 func restoreNM(t *testing.T, state int, checkURI string, probeURL string, probeErr error) *fakeNMObj {
 	t.Helper()
+	// fresh gate/watcher per test: warn-once + throttle flags are global
+	oldGate := nmGateState
+	savedGate := *oldGate // value snapshot for restore
+	fresh := *oldGate     // fresh flags: warned=false, throttle reset
+	nmGateState = &fresh
+	t.Cleanup(func() { *nmGateState = savedGate; resetCheckEnabledCache() })
+
 	obj := &fakeNMObj{
 		state:    uint32(state),
 		checkOn:  true,
@@ -1129,16 +1428,21 @@ func restoreNM(t *testing.T, state int, checkURI string, probeURL string, probeE
 	}
 	conn := &fakeNMConn{obj: obj}
 	origDial, origURIs, origHTTP, origHy, origClock := realDial, nmCheckURIs, httpDo, portalHysteresis, clockNow
+	origCheck := CheckPortal
 	realDial = func(context.Context) (nmConn, error) { return conn, nil }
 	nmCheckURIs = func(context.Context) ([]string, error) { return []string{checkURI}, nil }
 	httpDo = func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{probeURL}}, Body: http.NoBody}, probeErr
 	}
+	// un-stub CheckPortal: restoreNM tests exercise the real gate path
+	CheckPortal = checkPortalReal
 	portalHysteresis = 2
 	resetGatewayCandidate()
+	resetCheckEnabledCache()
 	t.Cleanup(func() {
-		realDial, nmCheckURIs, httpDo, portalHysteresis, clockNow = origDial, origURIs, origHTTP, origHy, origClock
+		realDial, nmCheckURIs, httpDo, portalHysteresis, clockNow, CheckPortal = origDial, origURIs, origHTTP, origHy, origClock, origCheck
 		resetGatewayCandidate()
+		resetCheckEnabledCache()
 	})
 	return obj
 }
@@ -1200,8 +1504,8 @@ func TestPortalStateNames(t *testing.T) {
 
 func TestTickPortalDisconnectsOnPortal(t *testing.T) {
 	ft := installFakeTailscale(t)
-	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	a := newTestApp(t, &fakeUI{})
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	a.smart = &smartAuto{primed: true}
 	st := &Status{BackendState: "Running"}
 
@@ -1241,8 +1545,8 @@ func TestTickPortalDoesNotReDisconnect(t *testing.T) {
 
 func TestTickPortalReupsOnClear(t *testing.T) {
 	ft := installFakeTailscale(t)
-	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	a := newTestApp(t, &fakeUI{})
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	st := &Status{BackendState: "Running"}
 	a.tickPortal(st) // arm (hysteresis)
 	a.tickPortal(st) // detect + disconnect + mark reup
@@ -1477,9 +1781,9 @@ func TestPortalHysteresisFlapResists(t *testing.T) {
 
 func TestHysteresisConfigurable(t *testing.T) {
 	ft := installFakeTailscale(t)
+	a := newTestApp(t, &fakeUI{})
 	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	obj.state = nmConnectivityPortal
-	a := newTestApp(t, &fakeUI{})
 	st := &Status{BackendState: "Running"}
 
 	portalHysteresis = 3
@@ -2464,9 +2768,18 @@ func TestRunAppPollsContinuously(t *testing.T) {
 
 	ui := &fakeUI{reg: true}
 	ctx, stop := context.WithCancel(context.Background())
-	go runApp(ctx, stop, ui)
+	done := make(chan struct{})
+	go func() {
+		runApp(ctx, stop, ui)
+		close(done)
+	}()
 	time.Sleep(80 * time.Millisecond)
 	stop()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runApp did not exit after stop")
+	}
 	updates, _, _, _ := ui.snapshot()
 	if updates < 2 {
 		t.Errorf("updates = %d after 16 poll intervals, want >= 2", updates)
@@ -2514,4 +2827,25 @@ func TestNewIDSequence(t *testing.T) {
 	}
 }
 
-func TestMain(_ *testing.T) {} // placeholder to satisfy editors listing main
+// TestMain disables real system access for the whole test binary:
+// NM buses and portal probes never touch the network. Tests that
+// exercise the portal machinery swap everything back via restoreNM
+// (see also: the individual seam fakes).
+func TestMain(m *testing.M) {
+	realDial = func(context.Context) (nmConn, error) { return nil, errors.New("no NM in tests") }
+	nmCheckURIs = func(context.Context) ([]string, error) { return nil, errors.New("no NM in tests") }
+	httpDo = func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("no portal probe in tests")
+	}
+	probeHTTPDo = func(*net.Dialer, *http.Request) (*http.Response, error) {
+		return nil, errors.New("no self-probe in tests")
+	}
+	CheckPortal = func(context.Context) (int, string) { return nmConnectivityFull, "" }
+	checkEnabledState = &struct {
+		mu      sync.Mutex
+		loaded  bool
+		enabled bool
+	}{mu: sync.Mutex{}, loaded: true, enabled: true}
+	nmGateState = &nmGate{}
+	os.Exit(m.Run())
+}

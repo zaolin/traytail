@@ -10,6 +10,10 @@ build:
 
 install: build
 	install -Dm755 traytail $(DESTDIR)$(BINDIR)/traytail
+	# fwmark bypass (portal probes past an active tunnel) needs CAP_NET_ADMIN; skip silently when not root
+	-if [ -z "$(DESTDIR)" ] && command -v setcap >/dev/null 2>&1; then \
+		setcap cap_net_admin+ep $(DESTDIR)$(BINDIR)/traytail 2>/dev/null && echo "setcap: portal probes can bypass the tunnel" || true; \
+	fi
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/traytail

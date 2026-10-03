@@ -218,29 +218,61 @@ func (a *app) applySmartTarget(home bool, st *Status) {
 
 // smartTarget resolves the policy exit node for the given home state:
 // home -> last-used Mullvad node (persisted), away -> first online own
-// exit node advertising a LAN. Callers must NOT hold s.mu: this may
-// update and persist the last-used Mullvad record.
+// exit node advertising a LAN. When away and no own node is online,
+// falls back to the last-used Mullvad node (no dead "no target" state
+// just because the home router is down). Callers must NOT hold s.mu:
+// this may update and persist the last-used Mullvad record.
 func (a *app) smartTarget(home bool, st *Status) string {
+	nodes := ExitNodeInfos(st)
 	if home {
-		nodes := ExitNodeInfos(st)
 		target := PickMullvadNode(st, nodes, LoadLastMullvad())
 		if target != "" {
 			StoreLastMullvad(target)
 		}
 		return target
 	}
-	return a.pickOwnNode(st)
+	if own := a.pickOwnNode(st); own != "" {
+		return own
+	}
+	// away but no own exit node available: use Mullvad instead
+	log.Printf("traytail: smart auto: away but no online own exit node, falling back to Mullvad")
+	target := PickMullvadNode(st, nodes, LoadLastMullvad())
+	if target != "" {
+		StoreLastMullvad(target)
+	}
+	return target
 }
 
 // pickOwnNode returns the hostname of the first online own exit node
 // advertising a LAN, or "" when none is available.
 // tickPortal runs the captive-portal state machine ahead of every UI
-// refresh: when NetworkManager reports a portal, disconnect tailscale
-// (exit-node traffic can't reach the hijacking portal) and remember to
-// re-up; when the portal clears, bring tailscale back up.
+// refresh: when a portal is detected, disconnect tailscale (exit-node
+// traffic can't reach the hijacking portal) and remember to re-up;
+// when the portal clears, bring tailscale back up.
+//
+// Detection runs two probes:
+//   - NM's verdict (throttled fresh CheckConnectivity + cached read)
+//   - a self-probe of the NM check URI bound to the Wi-Fi interface
+//     with tailscale's fwmark bypass, so a live tunnel can't hide the
+//     portal. Either signal triggers.
 func (a *app) tickPortal(st *Status) {
 	p := &a.portal
 	state, url := CheckPortal(context.Background())
+
+	// Self-probe when NM can't be trusted: check disabled, or tunnel
+	// swallows everything. The self-probe OVERRIDES the NM verdict in
+	// both directions — with the check disabled, the cached state is
+	// meaningless and a stale PORTAL must not block re-up.
+	if !portalNMAuthoritative(st) {
+		if ok, purl := selfCheckPortalFull(context.Background(), st); ok {
+			state = nmConnectivityPortal
+			if purl != "" {
+				url = purl
+			}
+		} else if state != nmConnectivityPortal || !nmCheckEnabledCached() {
+			state = nmConnectivityFull // self-probe clear wins
+		}
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -288,6 +320,36 @@ func (a *app) tickPortal(st *Status) {
 	}
 }
 
+// portalNMAuthoritative reports whether NM's cached verdict can be
+// trusted this tick: NM is authoritative when its check is enabled
+// AND no tunnel swallows our own probes (exit node inactive).
+func portalNMAuthoritative(st *Status) bool {
+	if st.Running() && st.ExitNodePeer() != nil {
+		return false // tunnel active: NM sees only the tunnel exit
+	}
+	if !nmCheckEnabledCached() {
+		return false
+	}
+	return true
+}
+
+// selfCheckPortalFull runs a full self-probe: NM check URI + gateway
+// resolution + interface binding. Returns (isPortal, loginURL).
+func selfCheckPortalFull(ctx context.Context, st *Status) (bool, string) {
+	uris, err := nmCheckURIs(ctx)
+	if err != nil || len(uris) == 0 {
+		return false, ""
+	}
+	bind := bindIPFor()
+	if bind == "" {
+		return false, ""
+	}
+	gw, _ := primaryGateway(ctx)
+	if gw != "" {
+		setGatewayCandidate(gw)
+	}
+	return selfCheckPortal(ctx, bind, uris[0], gw)
+}
 // portalInfo snapshots the portal watcher state.
 func (a *app) portalInfo() (bool, string) {
 	a.portal.mu.Lock()

@@ -323,10 +323,9 @@ func gatewayLoginCandidate() string {
 // before tickPortal acts (protects against single flapping checks).
 var portalHysteresis = 2
 
-// CheckPortal returns the current connectivity state plus the portal
-// login URL when the state reads PORTAL. On a live portal the gateway
-// is resolved first so 200-body portals have a login candidate.
-func CheckPortal(ctx context.Context) (int, string) {
+// checkPortalReal is the production CheckPortal implementation;
+// CheckPortal is a var (tests stub it, restoreNM re-points here).
+func checkPortalReal(ctx context.Context) (int, string) {
 	state, err := nmGateState.connectivity(ctx)
 	if err != nil {
 		return nmConnectivityUnknown, ""
@@ -370,3 +369,45 @@ func portalStateName(s int) string {
 // logWarnf is a seam so nm.go logging stays consistent with the app
 // logger (wired in main.go to log.Printf with the traytail prefix).
 var logWarnf = func(format string, args ...any) {}
+// checkEnabledState mirrors the NM setting; refreshed each read
+// (a cheap property call) so test fakes and live changes apply.
+var checkEnabledState = &struct {
+	mu      sync.Mutex
+	loaded  bool
+	enabled bool
+}{}
+
+// nmCheckEnabledCached reports whether NM's connectivity check is on.
+// Falls back to the last known value when the bus is unreachable.
+// Var (not func) so the TestMain stub can replace it entirely.
+var nmCheckEnabledCached = func() bool {
+	conn, err := realDial(context.Background())
+	if err != nil {
+		return true // unknowable: assume enabled
+	}
+	defer conn.close()
+	obj := conn.objectAt(nmPath)
+	var enabled bool
+	if err := getProperty(obj, "", nmInterface, "ConnectivityCheckEnabled", &enabled); err != nil {
+		checkEnabledState.mu.Lock()
+		last := checkEnabledState.enabled
+		checkEnabledState.mu.Unlock()
+		return last
+	}
+	checkEnabledState.mu.Lock()
+	checkEnabledState.enabled = enabled
+	checkEnabledState.mu.Unlock()
+	return enabled
+}
+
+// resetCheckEnabledCache clears the memo (tests).
+func resetCheckEnabledCache() {
+	checkEnabledState.mu.Lock()
+	checkEnabledState.enabled = false
+	checkEnabledState.mu.Unlock()
+}
+
+// CheckPortal returns the current connectivity state plus the portal
+// login URL when the state reads PORTAL. Var (not func) so tests can
+// swap the whole gate (restoreNM re-points it to checkPortalReal).
+var CheckPortal = checkPortalReal
