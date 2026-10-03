@@ -1,6 +1,7 @@
 # traytail
 
 [![CI](https://github.com/zaolin/traytail/actions/workflows/ci.yml/badge.svg)](https://github.com/zaolin/traytail/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/zaolin/traytail)](https://github.com/zaolin/traytail/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A minimal Tailscale tray icon for Wayland bars that host the
