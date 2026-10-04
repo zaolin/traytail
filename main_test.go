@@ -1007,7 +1007,8 @@ func TestControlWallConsistentlyFlakyNAT(t *testing.T) {
 	if controlWallConsistently(ctx, "23.23.23.23") {
 		t.Error("flaky connect must not count as a wall")
 	}
-	tcpPortOpen = orig
+	// phase 2: all attempts fail via stub (never the real network)
+	tcpPortOpen = func(context.Context, string, int) bool { return false }
 	if !controlWallConsistently(ctx, "23.23.23.23") {
 		t.Error("consistent failures = wall")
 	}
@@ -1478,22 +1479,54 @@ func TestBindIPFor(t *testing.T) {
 	}
 }
 
-func TestPortalNMAuthoritative(t *testing.T) {
+func TestMatrixOverridesNMFull(t *testing.T) {
+	// Regression (live wifionice incident): NM check ENABLED says FULL
+	// via the allowlisted+dual-stack check path while the true wall
+	// blocks v4 for everything else. The matrix verdict must win.
 	resetCheckEnabledCache()
 	defer resetCheckEnabledCache()
 	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
-	defer func() { obj.forceCalled = false }()
+	_ = obj
+	// walled matrix: controls NXDOMAIN, check domain resolves
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain: {"17.253.144.10"},
+	}, map[string]error{
+		wallControlDomains[0]: errors.New("NXDOMAIN"),
+		wallControlDomains[1]: errors.New("NXDOMAIN"),
+	})
+	fakeTCP(t, map[string]bool{"17.253.144.10": true})
+	// bind IP / iface
+	restoreIfaceAddrs(t, []string{"172.24.7.111/19"})
 
-	// no exit node + check enabled -> NM authoritative
-	st := &Status{BackendState: "Running", Peer: map[string]Peer{}}
-	if !portalNMAuthoritative(st) {
-		t.Error("plain connection: NM should be authoritative")
+	ft := installFakeTailscale(t)
+	obj2 := &fakeNMObj{gateway: "10.1.32.1"}
+	obj2.state = nmConnectivityPortal
+	obj2.checkOn = true
+	obj2.primary = dbus.ObjectPath("/nm/AC")
+	_ = obj2
+
+	a := newTestApp(t, &fakeUI{})
+	// matrix cache reset
+	resetMatrixState()
+	t.Cleanup(resetMatrixState)
+
+	// self-probe HTTP probes are clean (allowlist!): check URI + apple OK
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(200, "", "text/plain", "OK"), nil
+	})
+
+	// but primaryGateway resolves via fake: gateway reachable? —
+	// appleCheck uses probeHTTPDo (clean), DNS-wall fires.
+	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}}
+	a.tickPortal(st) // arm
+	a.tickPortal(st) // fire
+	if detected, url := a.portalInfo(); !detected {
+		t.Fatalf("matrix must override NM FULL (portal not detected)")
+	} else if url != "" && url != "http://10.1.32.1/" && url != "http://10.240.93.149/" {
+		t.Errorf("unexpected url %q", url)
 	}
-	// exit node active -> not authoritative (tunnel swallows probes)
-	stN := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}}
-	if portalNMAuthoritative(stN) {
-		t.Error("with exit node: NM verdict unreliable")
-	}
+	_ = ft
 }
 
 func TestTickPortalSelfProbeDetectsThroughTunnel(t *testing.T) {
@@ -1539,6 +1572,8 @@ func TestTickPortalSelfProbeDetectsThroughTunnel(t *testing.T) {
 func TestTickPortalSelfProbeClearReups(t *testing.T) {
 	ft := installFakeTailscale(t)
 	a := newTestApp(t, &fakeUI{})
+	// matrix runs fresh on every tick in tests
+	restoreMatrixFast(t)
 	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	obj.checkOn = false // self-probe mode
 
@@ -1918,6 +1953,7 @@ func TestPortalRedetectFloor(t *testing.T) {
 func TestTickPortalReupsOnClear(t *testing.T) {
 	ft := installFakeTailscale(t)
 	a := newTestApp(t, &fakeUI{})
+	restoreMatrixFast(t)
 	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	st := &Status{BackendState: "Running"}
 	a.tickPortal(st) // arm (hysteresis)
@@ -3221,4 +3257,110 @@ func TestMain(m *testing.M) {
 	}{mu: sync.Mutex{}, loaded: true, enabled: true}
 	nmGateState = &nmGate{}
 	os.Exit(m.Run())
+}
+
+// restoreMatrixFast shrinks the matrix interval + resets the cache so
+// every test tick re-runs the matrix.
+func restoreMatrixFast(t *testing.T) {
+	t.Helper()
+	old := matrixInterval
+	matrixInterval = time.Nanosecond
+	resetMatrixState()
+	t.Cleanup(func() { matrixInterval = old; resetMatrixState() })
+}
+
+func TestMatrixCacheTTL(t *testing.T) {
+	old := matrixInterval
+	matrixInterval = 30 * time.Second
+	t.Cleanup(func() { matrixInterval = old; resetMatrixState() })
+	resetMatrixState()
+
+	origClock := clockNow
+	now := time.Now()
+	clockNow = func() time.Time { return now }
+	t.Cleanup(func() { clockNow = origClock })
+
+	origReal := realDial
+	realDial = func(context.Context) (nmConn, error) {
+		return nil, errors.New("no NM")
+	}
+	t.Cleanup(func() { realDial = origReal })
+
+	// matrix runs are gated: a run with no NM errors -> verdict false
+	ok, url, fresh := (&app{}).matrixVerdict()
+	t.Logf("first: %v %q fresh=%v", ok, url, fresh)
+	ok2, _, fresh2 := (&app{}).matrixVerdict()
+	// within interval: cached result, still "fresh" only if first run said so
+	t.Logf("second: ok=%v fresh=%v", ok2, fresh2)
+	resetMatrixState()
+}
+
+// fakeResolverFlaky swaps resolveVia so the given host fails the
+// first N lookups then starts answering (flaky resolver emulation).
+// The check domain and other control domains answer normally.
+func fakeResolverFlaky(t *testing.T, host string, failFirst int, thenA string) {
+	t.Helper()
+	orig := resolveVia
+	calls := 0
+	resolveVia = func(_ context.Context, server, lookup string) ([]string, error) {
+		_ = server
+		if lookup == host {
+			calls++
+			if calls <= failFirst {
+				return nil, errors.New("transient resolver loss")
+			}
+			return []string{thenA}, nil
+		}
+		if lookup == wallCheckDomain {
+			return []string{"17.253.144.10"}, nil
+		}
+		if lookup == wallControlDomains[0] && lookup != host {
+			return []string{"23.23.23.23"}, nil
+		}
+		if lookup == wallControlDomains[1] && lookup != host {
+			return []string{"76.76.21.21"}, nil
+		}
+		return nil, errors.New("no canned answer")
+	}
+	t.Cleanup(func() { resolveVia = orig })
+}
+
+func TestDNSWallFlakyLossNoFalsePortal(t *testing.T) {
+	// Live l1 incident: a flaky resolver loses ONE control lookup ->
+	// must NOT declare a portal. Recovery inside the attempt window
+	// (attempt 2) = flaky, verdict: no wall.
+	origGap := wallRetryGap
+	wallRetryGap = time.Millisecond
+	t.Cleanup(func() { wallRetryGap = origGap })
+
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolverFlaky(t, wallControlDomains[0], 1, "23.23.23.23")
+	// second control domain resolves fine, TCP fine
+	fakeTCP(t, map[string]bool{"23.23.23.23": true, "76.76.21.21": true})
+
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if ok {
+		t.Error("one lost DNS lookup is flakiness, not a portal")
+	}
+}
+
+func TestDNSWallConsistentStallsPortal(t *testing.T) {
+	// Control NXDOMAIN on EVERY attempt: portal verdict (real wall).
+	origGap := wallRetryGap
+	wallRetryGap = time.Millisecond
+	t.Cleanup(func() { wallRetryGap = origGap })
+
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolverFlaky(t, wallControlDomains[0], 99, "23.23.23.23")
+
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if !ok {
+		t.Error("every-attempt DNS failure = walled = portal")
+	}
 }

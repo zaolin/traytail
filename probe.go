@@ -185,7 +185,10 @@ func selfCheckDNSWall(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	for _, host := range wallControlDomains {
-		if aRecordsAreWalled(ctx, server, host) {
+		// DNS wall needs the same consistency gate as the TCP wall:
+		// flaky resolvers (phone hotspot, train NAT) lose single
+		// lookups; a real wall fails EVERY attempt.
+		if controlDNSWallConsistently(ctx, server, host) {
 			return true, nil // walled A-records + alive allowlist = portal
 		}
 		// Routing wall: A-resolves but TCP :80 connect fails EVERY
@@ -216,6 +219,19 @@ const wallAttempts = 3
 func controlWallConsistently(ctx context.Context, ip string) bool {
 	for i := 0; i < wallAttempts; i++ {
 		if tcpPortOpen(ctx, ip, 80) {
+			return false
+		}
+		time.Sleep(wallRetryGap)
+	}
+	return true
+}
+
+// controlDNSWallConsistently asks the portal DNS for the control
+// host's A-record wallAttempts times; only consistent failure counts
+// as walled (flaky resolvers lose single lookups).
+func controlDNSWallConsistently(ctx context.Context, server, host string) bool {
+	for i := 0; i < wallAttempts; i++ {
+		if !aRecordsAreWalled(ctx, server, host) {
 			return false
 		}
 		time.Sleep(wallRetryGap)

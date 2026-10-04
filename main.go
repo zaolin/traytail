@@ -252,27 +252,33 @@ func (a *app) smartTarget(home bool, st *Status) string {
 // traffic can't reach the hijacking portal) and remember to re-up;
 // when the portal clears, bring tailscale back up.
 //
-// Detection runs two probes:
+// Detection runs two probe sets:
 //   - NM's verdict (throttled fresh CheckConnectivity + cached read)
-//   - a self-probe of the NM check URI bound to the Wi-Fi interface
-//     with tailscale's fwmark bypass, so a live tunnel can't hide the
-//     portal. Either signal triggers.
+//   - the self-probe set, ALWAYS: check-URI + Apple body + DNS-wall
+//     matrix (walled-garden portals like wifionice allowlist the
+//     check domains and keep IPv6 open — NM's "FULL" lies there, so
+//     it only triggers fast and can never veto the matrix)
 func (a *app) tickPortal(st *Status) {
 	p := &a.portal
-	state, url := CheckPortal(context.Background())
+	nmState, nmURL := CheckPortal(context.Background())
+	matrixPortal, matrixURL, matrixFresh := a.matrixVerdict()
 
-	// Self-probe when NM can't be trusted: check disabled, or tunnel
-	// swallows everything. The self-probe OVERRIDES the NM verdict in
-	// both directions — with the check disabled, the cached state is
-	// meaningless and a stale PORTAL must not block re-up.
-	if !portalNMAuthoritative(st) {
-		if ok, purl := selfCheckPortalFull(context.Background(), st); ok {
-			state = nmConnectivityPortal
-			if purl != "" {
-				url = purl
-			}
-		} else if state != nmConnectivityPortal || !nmCheckEnabledCached() {
-			state = nmConnectivityFull // self-probe clear wins
+	state, url := nmState, nmURL
+	if matrixPortal {
+		// The matrix is the trusted signal: walled-garden portals keep
+		// NM's check path reachable by design.
+		state = nmConnectivityPortal
+		if matrixURL != "" {
+			url = matrixURL
+		}
+	} else if matrixFresh {
+		// A fresh matrix clear downgrades NM when NM's own view can't
+		// be trusted: FULL from an allowlist-deceivable check path, or
+		// a stale PORTAL from a disabled check (nothing re-probed).
+		if nmState == nmConnectivityFull && nmMatrixOverride() {
+			state = nmConnectivityFull
+		} else if nmState == nmConnectivityPortal && !nmCheckEnabledCached() {
+			state = nmConnectivityFull // stale PORTAL, check disabled
 		}
 	}
 
@@ -341,18 +347,49 @@ func (a *app) tickPortal(st *Status) {
 	}
 }
 
-// portalNMAuthoritative reports whether NM's cached verdict can be
-// trusted this tick: NM is authoritative when its check is enabled
-// AND no tunnel swallows our own probes (exit node inactive).
-func portalNMAuthoritative(st *Status) bool {
-	if st.Running() && st.ExitNodePeer() != nil {
-		return false // tunnel active: NM sees only the tunnel exit
-	}
-	if !nmCheckEnabledCached() {
-		return false
-	}
-	return true
+// matrixInterval: the DNS-wall matrix runs at most this often; the
+// verdict is cached between runs (each run costs ~2–4s of TCP probes).
+// Var so tests can shrink it (restoreMatrixFast).
+var matrixInterval = 30 * time.Second
+
+// matrixState caches the last matrix verdict.
+var matrixState struct {
+	mu      sync.Mutex
+	portal  bool
+	url     string
+	fresh   bool // verdict came from THIS interval's run
+	lastRun time.Time
 }
+
+// resetMatrixState clears the cached matrix verdict (tests).
+func resetMatrixState() {
+	matrixState.mu.Lock()
+	matrixState.portal, matrixState.url, matrixState.fresh = false, "", false
+	matrixState.lastRun = time.Time{}
+	matrixState.mu.Unlock()
+}
+
+// matrixVerdict returns the cached-or-fresh matrix verdict.
+// (portal, url, freshThisInterval)
+func (a *app) matrixVerdict() (bool, string, bool) {
+	matrixState.mu.Lock()
+	defer matrixState.mu.Unlock()
+	now := clockNow()
+	if now.Sub(matrixState.lastRun) < matrixInterval {
+		return matrixState.portal, matrixState.url, matrixState.fresh
+	}
+	// run serialized under the lock (single poller thread — no
+	// contention; keeps tick/clear verdicts consistent)
+	matrixState.lastRun = now
+	ok, url := selfCheckPortalFull(context.Background(), &Status{BackendState: "Running"})
+	matrixState.portal, matrixState.url, matrixState.fresh = ok, url, true
+	return ok, url, true
+}
+
+// nmMatrixOverride gates the downgrade of an NM FULL by a fresh
+// matrix clear. Currently: always (NM's check-domain path is
+// allowlist-deceivable). Seam for future policy.
+var nmMatrixOverride = func() bool { return true }
 
 // selfCheckPortalFull runs the full self-probe set (three signals,
 // any one triggers the portal verdict):
