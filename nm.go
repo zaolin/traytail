@@ -101,6 +101,16 @@ func getProperty(obj nmObject, path, iface, name string, out any) error {
 		case []string:
 			*o = raw
 		}
+	case *[]uint32:
+		// NM packed nameservers etc. ('au'); also accept []int32
+		switch raw := v.Value().(type) {
+		case []uint32:
+			*o = raw
+		case []int32:
+			for _, x := range raw {
+				*o = append(*o, uint32(x))
+			}
+		}
 	default:
 		return fmt.Errorf("getProperty %s: unsupported type %T", name, out)
 	}

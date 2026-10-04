@@ -91,13 +91,26 @@ Detection details and hardening:
   falls back to the default gateway read from NM
   (`PrimaryConnection -> Ip4Config -> Gateway`) and offers
   `http://<gateway>/` as the login URL.
+- **Walled-garden portals** (German ICE trains / wifionice class):
+  these deliberately *allowlist* the standard check domains (Apple,
+  fedoraproject — verified live), so the checks always "pass" while
+  the wall is up, and they often leave native IPv6 unfiltered, which
+  defeats dual-stack probes. traytail detects them with a matrix
+  through the portal's own DNS server (read from NM over DBus):
+  IPv4 A-record resolvability plus TCP :80 reachability of control
+  domains (`neverssl.com`, `tailscale.com`) against the always-allowed
+  Apple check domain. Control blocked + check alive (DNS or TCP) =
+  portal. No login URL is derivable there — use the portal page the
+  network redirects your browser to.
+- Apple's exact 69-byte `Success` body is used as a content-injection
+  detector for hijack portals (a replaced body fails the match).
 - If the NM connectivity check is disabled entirely, traytail logs a
-  one-time warning and portal detection is inactive.
+  one-time warning and relies on the self-probes instead.
 
 Known limitations: detection is NM-only (no iwd/networkd support);
 while a tailscale tunnel is active NM's check rides the tunnel and
-cannot see the portal — detection matters exactly when the tunnel is
-broken, which the disconnect/reconnect cycle handles.
+cannot see the portal — the self-probe (with `cap_net_admin` fwmark
+bypass, granted by `sudo make install`) covers that case.
 
 **Exit node selection:** entries are labelled with full city/country
 names taken from the tailnet's own `Location` data (via

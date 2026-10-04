@@ -50,11 +50,12 @@ type app struct {
 // portalWatcher tracks NetworkManager connectivity and the captive
 // portal login URL discovered from the hijacked connectivity check.
 type portalWatcher struct {
-	mu         sync.Mutex
-	detected   bool
-	url        string
-	reupNeeded bool // tailscale was auto-disconnected; re-up on clear
-	streak     int  // consecutive PORTAL readings (hysteresis)
+	mu          sync.Mutex
+	detected    bool
+	url         string
+	reupNeeded  bool // tailscale was auto-disconnected; re-up on clear
+	streak      int  // consecutive PORTAL readings (hysteresis)
+	clearStreak int  // consecutive CLEAN readings to clear (hysteresis)
 }
 
 // smartAuto tracks the home/away state machine. It applies the policy
@@ -287,6 +288,7 @@ func (a *app) tickPortal(st *Status) {
 		if !p.detected {
 			p.detected = true
 			p.url = url
+			p.clearStreak = 0
 			log.Printf("traytail: captive portal detected (%s), url=%q", portalStateName(state), url)
 		} else if p.url == "" && url != "" {
 			p.url = url // retry found the login URL
@@ -301,6 +303,17 @@ func (a *app) tickPortal(st *Status) {
 		}
 	case nmConnectivityFull, nmConnectivityLimited:
 		p.streak = 0
+		if !p.detected && !p.reupNeeded {
+			return // nothing to clear
+		}
+		// Clear-hysteresis: require consecutive CLEAN verdicts before
+		// clearing, mirroring the detection streak — the walled matrix
+		// oscillates on flaky train networks.
+		p.clearStreak++
+		if p.clearStreak < portalHysteresis {
+			return
+		}
+		p.clearStreak = 0
 		if p.detected {
 			log.Printf("traytail: portal cleared (%s)", portalStateName(state))
 		}
@@ -333,13 +346,19 @@ func portalNMAuthoritative(st *Status) bool {
 	return true
 }
 
-// selfCheckPortalFull runs a full self-probe: NM check URI + gateway
-// resolution + interface binding. Returns (isPortal, loginURL).
+// selfCheckPortalFull runs the full self-probe set (three signals,
+// any one triggers the portal verdict):
+//  1. HTTP-probe of the NM check URI, IPv4-only (hijack portals,
+//     redirect or replaced body)
+//  2. Apple hotspot check (exact-body match; catches portals that
+//     hijack the check URI with real-looking responses)
+//  3. DNS-wall matrix through the portal's own DNS server — the
+//     wifionice class: DNS allowlist + NAT64 + deliberately
+//     allowlisted standard check domains
+//
+// Returns (isPortal, loginURL) with a URL when a redirect portal
+// betrayed its Location, or the gateway for body-hijack cases.
 func selfCheckPortalFull(ctx context.Context, st *Status) (bool, string) {
-	uris, err := nmCheckURIs(ctx)
-	if err != nil || len(uris) == 0 {
-		return false, ""
-	}
 	bind := bindIPFor()
 	if bind == "" {
 		return false, ""
@@ -348,8 +367,29 @@ func selfCheckPortalFull(ctx context.Context, st *Status) (bool, string) {
 	if gw != "" {
 		setGatewayCandidate(gw)
 	}
-	return selfCheckPortal(ctx, bind, uris[0], gw)
+
+	// 1+2: HTTP verdicts (check URI first, then Apple as backup).
+	uris, _ := nmCheckURIs(ctx)
+	if len(uris) > 0 {
+		if ok, url := selfCheckPortal(ctx, bind, uris[0], gw); ok {
+			return true, url
+		}
+	}
+	verdict, url := appleCheck(ctx, bind)
+	if verdict == probeHijacked {
+		return true, url
+	}
+	if verdict == probeUnknown && len(uris) == 0 {
+		return false, "" // transport broken and no URI: no verdict
+	}
+
+	// 3: DNS wall (wifionice class).
+	if ok, err := selfCheckDNSWall(ctx); err == nil && ok {
+		return true, gatewayURL(gw)
+	}
+	return false, ""
 }
+
 // portalInfo snapshots the portal watcher state.
 func (a *app) portalInfo() (bool, string) {
 	a.portal.mu.Lock()
@@ -379,7 +419,10 @@ func portalKey(a *app) string {
 func (a *app) pickOwnNode(st *Status) string {
 	for _, p := range st.SortPeers() {
 		if p.ExitNodeOption && p.Online && !p.IsMullvad() && len(p.PrimaryRoutes) > 0 {
-			return p.HostName
+			// set --exit-node resolves DNS names, not HostNames
+			// (HostName may be user-renamed: "Nabara" vs DNS
+			// "zds-nabara.tailb4e47d.ts.net").
+			return p.BaseName()
 		}
 	}
 	return ""

@@ -541,6 +541,23 @@ func TestFirstIPv4(t *testing.T) {
 	}
 }
 
+func TestPackedIPv4RoundTrip(t *testing.T) {
+	packed, err := ipv4ToPackedUint32("10.240.93.149")
+	if err != nil || packed[0] != 0x955df00a { // live NM value (wifionice DNS)
+		t.Fatalf("pack = %x err=%v, want 0x955df00a", packed, err)
+	}
+	if got := packedUint32ToIPv4(0x955df00a); got != "10.240.93.149" {
+		t.Errorf("decode = %q, want 10.240.93.149", got)
+	}
+	p2, err := ipv4ToPackedUint32("192.168.1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := packedUint32ToIPv4(p2[0]); got != "192.168.1.1" {
+		t.Errorf("roundtrip 192.168.1.1 = %q", got)
+	}
+}
+
 func TestSplitMullvad(t *testing.T) {
 	cc, city := splitMullvad("de-fra-wg-001")
 	if cc != "de" || city != "fra" {
@@ -727,7 +744,7 @@ func TestExitNodeMenuAutoClickEnables(t *testing.T) {
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=zds-nabara" {
+	if got := ft.lastCall(t); got[0] != "set" || got[1] != "--exit-node=zds-nabara.tailb4e47d.ts.net" {
 		t.Errorf("smart auto enable ran %v, want own node (away)", got)
 	}
 	if !a.smartPrimed() {
@@ -859,7 +876,268 @@ func TestExitNodeMenuNoNodesPlaceholder(t *testing.T) {
 	}
 }
 
-// ---- listRowActive + own-item deselect ----
+// ---- DNS-wall matrix (wifionice class) + Apple body check ----
+
+// fakeResolver swaps resolveVia with canned A-record answers:
+// host -> (ips, err). Empty ips + nil err = "only AAAA/NAT64" case.
+func fakeResolver(t *testing.T, answers map[string]([]string), errs map[string]error) {
+	t.Helper()
+	orig := resolveVia
+	resolveVia = func(_ context.Context, server, host string) ([]string, error) {
+		_ = server
+		if err, ok := errs[host]; ok {
+			return nil, err
+		}
+		if ips, ok := answers[host]; ok {
+			return ips, nil
+		}
+		return nil, errors.New("no canned answer")
+	}
+	t.Cleanup(func() { resolveVia = orig })
+}
+
+func fakeDNSServer(t *testing.T, server string) {
+	t.Helper()
+	orig := dnsServerFor
+	dnsServerFor = func(context.Context) (string, error) { return server, nil }
+	t.Cleanup(func() { dnsServerFor = orig })
+}
+
+// fakeTCP swaps tcpPortOpen with canned per-IP answers (host -> open?).
+func fakeTCP(t *testing.T, open map[string]bool) {
+	t.Helper()
+	orig := tcpPortOpen
+	tcpPortOpen = func(_ context.Context, host string, _ int) bool {
+		return open[host]
+	}
+	t.Cleanup(func() { tcpPortOpen = orig })
+}
+
+func TestDNSWallMatrixOpen(t *testing.T) {
+	// everything resolves with real A records: no portal
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain:       {"17.253.144.10"},
+		wallControlDomains[0]: {"23.23.23.23"},
+		wallControlDomains[1]: {"76.76.21.21"},
+	}, nil)
+	fakeTCP(t, map[string]bool{"23.23.23.23": true, "76.76.21.21": true, "17.253.144.10": true})
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil || ok {
+		t.Errorf("open network should not be portal: (%v,%v)", ok, err)
+	}
+}
+
+func TestDNSWallMatrixWalled(t *testing.T) {
+	// control domains NXDOMAIN, check domain resolves: portal
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain: {"17.253.144.10"},
+	}, map[string]error{
+		wallControlDomains[0]: errors.New("NXDOMAIN"),
+		wallControlDomains[1]: errors.New("NXDOMAIN"),
+	})
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if !ok {
+		t.Error("walled control + alive allowlist = portal")
+	}
+}
+
+func TestDNSWallMatrixNAT64Only(t *testing.T) {
+	// control domain answers ONLY AAAA (NAT64 synthetic): still walled for v4
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain:       {"17.253.144.10"},
+		wallControlDomains[0]: {"64:ff9b::17d7:b08c"}, // NAT64 synth
+		wallControlDomains[1]: {"64:ff9b::4c4c:1515"},
+	}, nil)
+	fakeTCP(t, map[string]bool{"17.253.144.10": true})
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if !ok {
+		t.Error("AAAA-only answers are NAT64 lies: walled")
+	}
+}
+
+func TestDNSWallMatrixRoutingWall(t *testing.T) {
+	// Live-verified wifionice state: DNS answers real A records for
+	// everything, but TCP :80 to control-IPs is walled while the
+	// allowlisted check IP stays reachable.
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain:       {"17.253.144.10"},
+		wallControlDomains[0]: {"23.23.23.23"},
+		wallControlDomains[1]: {"76.76.21.21"},
+	}, nil)
+	fakeTCP(t, map[string]bool{ // control blocked, check open
+		"23.23.23.23":   false,
+		"76.76.21.21":   false,
+		"17.253.144.10": true,
+	})
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if !ok {
+		t.Error("routed-blocked control + open check = portal")
+	}
+}
+
+func TestDNSWallMatrixRoutingWallAllBlocked(t *testing.T) {
+	// ALL v4 unreachable (plain outage): no verdict, not portal
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain:       {"17.253.144.10"},
+		wallControlDomains[0]: {"23.23.23.23"},
+		wallControlDomains[1]: {"76.76.21.21"},
+	}, nil)
+	fakeTCP(t, map[string]bool{ // everything blocked
+		"23.23.23.23":   false,
+		"76.76.21.21":   false,
+		"17.253.144.10": false,
+	})
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if ok {
+		t.Error("total TCP blackout should be unknown, not portal")
+	}
+}
+
+func TestDNSWallMatrixNetworkDown(t *testing.T) {
+	// check domain itself fails: DNS dead -> unknown, not portal
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, nil, map[string]error{
+		wallCheckDomain:       errors.New("timeout"),
+		wallControlDomains[0]: errors.New("timeout"),
+		wallControlDomains[1]: errors.New("timeout"),
+	})
+	ok, err := selfCheckDNSWall(context.Background())
+	if err != nil {
+		t.Fatalf("verdict err: %v", err)
+	}
+	if ok {
+		t.Error("dead DNS without allowlist anchor should be unknown, not portal")
+	}
+}
+
+func TestDNSWallNoDNSServer(t *testing.T) {
+	orig := dnsServerFor
+	dnsServerFor = func(context.Context) (string, error) { return "", errors.New("no wifi") }
+	t.Cleanup(func() { dnsServerFor = orig })
+	ok, err := selfCheckDNSWall(context.Background())
+	if err == nil {
+		t.Error("missing DNS server should error")
+	}
+	if ok {
+		t.Error("error path must not claim portal")
+	}
+}
+
+func TestAppleCheck(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(200, "", "text/html", appleSuccessBody), nil
+	})
+	verdict, url := appleCheck(context.Background(), "172.24.7.111")
+	if verdict != probeOK || url != "" {
+		t.Errorf("exact success body = (%d,%q), want (OK,\"\")", verdict, url)
+	}
+}
+
+func TestAppleCheckHijackedBody(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(200, "", "text/html", "<html>Please log in to the airport wifi</html>"), nil
+	})
+	verdict, url := appleCheck(context.Background(), "172.24.7.111")
+	if verdict != probeHijacked {
+		t.Errorf("replaced body = %d, want probeHijacked", verdict)
+	}
+	if url != "" {
+		t.Errorf("no redirect: url should be empty, got %q", url)
+	}
+}
+
+func TestAppleCheckSpoofedLength(t *testing.T) {
+	// 69-byte lookalike with injected content: body must byte-fail
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(200, "", "text/html",
+			"<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success<B>login</B></BODY></HTML>"), nil
+	})
+	if verdict, _ := appleCheck(context.Background(), "172.24.7.111"); verdict != probeHijacked {
+		t.Error("near-identical body must fail the exact match")
+	}
+}
+
+func TestAppleCheckRedirect(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(302, "http://portal/login", "", ""), nil
+	})
+	verdict, url := appleCheck(context.Background(), "172.24.7.111")
+	if verdict != probeHijacked || url != "http://portal/login" {
+		t.Errorf("redirect = (%d,%q)", verdict, url)
+	}
+}
+
+func TestAppleCheckDialError(t *testing.T) {
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network unreachable")
+	})
+	verdict, _ := appleCheck(context.Background(), "172.24.7.111")
+	if verdict != probeUnknown {
+		t.Errorf("transport error = %d, want probeUnknown", verdict)
+	}
+}
+
+func TestSelfCheckPortalFullDNSWallTriggers(t *testing.T) {
+	// End-to-end: HTTP probes clean (allowlisted), DNS wall verdict fires.
+	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	_ = obj
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// HTTP probes clean on both check URI and Apple
+	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
+		return respWith(200, "", "text/plain", "OK"), nil
+	})
+	// wait: apple check uses the same httpDo; need per-URL dispatch
+	origProbe := probeHTTPDo
+	probeHTTPDo = func(d *net.Dialer, req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.Host, "apple") || req.URL.Host == "captive.apple.com" {
+			return respWith(200, "", "text/html", appleSuccessBody), nil
+		}
+		return respWith(200, "", "text/plain", "OK"), nil
+	}
+	t.Cleanup(func() { probeHTTPDo = origProbe })
+
+	// resolveVia: check domain resolves (A), controls fail (NXDOMAIN)
+	fakeDNSServer(t, "10.240.93.149")
+	fakeResolver(t, map[string][]string{
+		wallCheckDomain: {"17.253.144.10"},
+	}, map[string]error{
+		wallControlDomains[0]: errors.New("NXDOMAIN"),
+		wallControlDomains[1]: errors.New("NXDOMAIN"),
+	})
+	// bind IP + gateway: primaryGateway resolves via the fake NM (10.1.32.1)
+	restoreIfaceAddrs(t, []string{"172.24.7.111/19"})
+
+	ok, url := selfCheckPortalFull(context.Background(),
+		&Status{
+			BackendState: "Running",
+			Peer:         map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)},
+		})
+	if !ok {
+		t.Fatal("DNS-wall verdict should trigger portal")
+	}
+	// URL is gateway-based (either fake gateway value)
+	if url != "http://10.1.32.1/" && url != "http://10.240.93.149/" {
+		t.Errorf("url = %q", url)
+	}
+}
 
 // TestListRowActiveByIP covers the renamed-device case: the status
 // peer's HostName is user-chosen ("Nabara") while the exit-node list
@@ -1256,7 +1534,8 @@ func TestTickPortalSelfProbeClearReups(t *testing.T) {
 	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
 		return respWith(204, "", "", ""), nil
 	})
-	a.tickPortal(&Status{BackendState: "Stopped"})
+	a.tickPortal(&Status{BackendState: "Stopped"}) // clear streak 1 (hysteresis)
+	a.tickPortal(&Status{BackendState: "Stopped"}) // clear streak 2 -> re-up
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
 		time.Sleep(5 * time.Millisecond)
@@ -1329,6 +1608,7 @@ type fakeNMObj struct {
 	ip4         dbus.ObjectPath // manager-level Ip4Config answer
 	ip4AC       dbus.ObjectPath // ActiveConnection-level Ip4Config answer
 	gateway     string
+	nameserver  string // packed Nameservers answer (dotted quad)
 	forceCalled bool
 }
 
@@ -1401,9 +1681,30 @@ func (o *cfgObj) Call(method string, flags dbus.Flags, args ...any) *dbus.Call {
 			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(o.host.gateway).Value())}, Err: nil}
 		case "Ip4Config":
 			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(o.host.ip4AC).Value())}, Err: nil}
+		case "Nameservers":
+			packed, err := ipv4ToPackedUint32(o.host.nameserver)
+			if err != nil {
+				return &dbus.Call{Err: err}
+			}
+			return &dbus.Call{Body: []any{dbus.MakeVariant(dbus.MakeVariant(packed).Value())}, Err: nil}
 		}
 	}
 	return &dbus.Call{Err: fmt.Errorf("fakeNM: unhandled %s %v", method, args)}
+}
+
+// ipv4ToPackedUint32 packs a dotted quad the way NM wire-orders it:
+// first octet becomes the least significant byte of the uint32
+// (round-trips with packedUint32ToIPv4's reverse decode).
+func ipv4ToPackedUint32(ip string) ([]uint32, error) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return nil, fmt.Errorf("bad ip %q", ip)
+	}
+	b := parsed.To4()
+	if b == nil {
+		return nil, fmt.Errorf("not v4: %q", ip)
+	}
+	return []uint32{uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24}, nil
 }
 
 // restoreNM swaps the NM gate with the fake bus; hysteresis is forced
@@ -1419,12 +1720,13 @@ func restoreNM(t *testing.T, state int, checkURI string, probeURL string, probeE
 	t.Cleanup(func() { *nmGateState = savedGate; resetCheckEnabledCache() })
 
 	obj := &fakeNMObj{
-		state:    uint32(state),
-		checkOn:  true,
-		checkURI: checkURI,
-		primary:  dbus.ObjectPath("/org/freedesktop/NetworkManager/ActiveConnection/1"),
-		ip4:      dbus.ObjectPath("/org/freedesktop/NetworkManager/IP4Config/1"),
-		gateway:  "10.1.32.1",
+		state:      uint32(state),
+		checkOn:    true,
+		checkURI:   checkURI,
+		primary:    dbus.ObjectPath("/org/freedesktop/NetworkManager/ActiveConnection/1"),
+		ip4:        dbus.ObjectPath("/org/freedesktop/NetworkManager/IP4Config/1"),
+		gateway:    "10.1.32.1",
+		nameserver: "10.1.32.1",
 	}
 	conn := &fakeNMConn{obj: obj}
 	origDial, origURIs, origHTTP, origHy, origClock := realDial, nmCheckURIs, httpDo, portalHysteresis, clockNow
@@ -1553,7 +1855,8 @@ func TestTickPortalReupsOnClear(t *testing.T) {
 
 	// clear: NM says full; tailscale still reports Stopped (down happened)
 	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
-	a.tickPortal(&Status{BackendState: "Stopped"})
+	a.tickPortal(&Status{BackendState: "Stopped"}) // clear streak 1 (hysteresis)
+	a.tickPortal(&Status{BackendState: "Stopped"}) // clear streak 2 -> re-up
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
 		time.Sleep(5 * time.Millisecond)
@@ -2038,7 +2341,7 @@ func TestTickSmartAutoRePrimeApplies(t *testing.T) {
 			setCall = c
 		}
 	}
-	if setCall == nil || setCall[1] != "--exit-node=zds-nabara" {
+	if setCall == nil || setCall[1] != "--exit-node=zds-nabara.tailb4e47d.ts.net" {
 		t.Errorf("re-prime should apply the policy target, ran %v", ft.callsSoFar(t))
 	}
 }
@@ -2102,7 +2405,7 @@ func TestTickSmartAutoFlipsHomeToAway(t *testing.T) {
 	if setCall == nil {
 		t.Fatalf("flip should apply own node, calls: %v", ft.callsSoFar(t))
 	}
-	if setCall[1] != "--exit-node=zds-nabara" {
+	if setCall[1] != "--exit-node=zds-nabara.tailb4e47d.ts.net" {
 		t.Errorf("away flip applied %v, want own node", setCall)
 	}
 }
@@ -2398,7 +2701,7 @@ func TestTickSmartAutoReAppliesAfterDisconnect(t *testing.T) {
 			setCall = c
 		}
 	}
-	if setCall == nil || setCall[1] != "--exit-node=zds-nabara" {
+	if setCall == nil || setCall[1] != "--exit-node=zds-nabara.tailb4e47d.ts.net" {
 		t.Errorf("reconnect should re-apply own node (away), calls after stop: %v", calls[nBefore:])
 	}
 }
