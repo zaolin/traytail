@@ -988,6 +988,31 @@ func TestDNSWallMatrixRoutingWall(t *testing.T) {
 	}
 }
 
+func TestControlWallConsistentlyFlakyNAT(t *testing.T) {
+	// Flaky shared NAT (train networks): the control IP connects ON
+	// some attempts — that's not a wall, no portal verdict.
+	origGap := wallRetryGap
+	wallRetryGap = time.Millisecond // fast test
+	t.Cleanup(func() { wallRetryGap = origGap })
+
+	ctx := context.Background()
+	// stub tcpPortOpen alternating open/blocked
+	orig := tcpPortOpen
+	calls := 0
+	tcpPortOpen = func(context.Context, string, int) bool {
+		calls++
+		return calls%2 == 1 // attempt 1 opens...
+	}
+	t.Cleanup(func() { tcpPortOpen = orig })
+	if controlWallConsistently(ctx, "23.23.23.23") {
+		t.Error("flaky connect must not count as a wall")
+	}
+	tcpPortOpen = orig
+	if !controlWallConsistently(ctx, "23.23.23.23") {
+		t.Error("consistent failures = wall")
+	}
+}
+
 func TestDNSWallMatrixRoutingWallAllBlocked(t *testing.T) {
 	// ALL v4 unreachable (plain outage): no verdict, not portal
 	fakeDNSServer(t, "10.240.93.149")
@@ -1842,6 +1867,51 @@ func TestTickPortalDoesNotReDisconnect(t *testing.T) {
 	n := len(ft.callsSoFar(t))
 	if n != nAfterDetect {
 		t.Errorf("portal persist should be deduped: %v", ft.callsSoFar(t))
+	}
+}
+
+func TestPortalRedetectFloor(t *testing.T) {
+	ft := installFakeTailscale(t)
+	origFloor := portalRedetectFloor
+	portalRedetectFloor = time.Minute
+	t.Cleanup(func() { portalRedetectFloor = origFloor })
+	origClock := clockNow
+	now := time.Now()
+	clockNow = func() time.Time { return now }
+	t.Cleanup(func() { clockNow = origClock })
+
+	a := newTestApp(t, &fakeUI{})
+	st := &Status{BackendState: "Running"}
+
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a.tickPortal(st) // arm
+	a.tickPortal(st) // detect + disconnect
+	// clear twice (hysteresis)
+	restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
+	a.tickPortal(&Status{BackendState: "Stopped"})
+	a.tickPortal(&Status{BackendState: "Stopped"}) // cleared; lastClear=now
+	if detected, _ := a.portalInfo(); detected {
+		t.Fatal("should be cleared")
+	}
+	nAftClear := len(ft.callsSoFar(t))
+
+	// portal verdict RETURNS immediately (flaky uplink): floor suppresses
+	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
+	a.tickPortal(st) // arm (streak 1)
+	a.tickPortal(st) // streak 2: would fire, but floor active
+	if detected, _ := a.portalInfo(); detected {
+		t.Error("portal re-detection must be floored after a recent clear")
+	}
+	if got := len(ft.callsSoFar(t)); got != nAftClear {
+		t.Errorf("floored detection must not call CLI: %d -> %d", nAftClear, got)
+	}
+
+	// after the floor passes: detection fires again (fresh hysteresis from 0)
+	clockNow = func() time.Time { return now.Add(2 * time.Minute) }
+	a.tickPortal(st) // arm (streak 1) — floor no longer active
+	a.tickPortal(st) // streak 2 → detect
+	if detected, url := a.portalInfo(); !detected || url != "http://portal/login" {
+		t.Errorf("after floor, detection should work: (%v,%q)", detected, url)
 	}
 }
 

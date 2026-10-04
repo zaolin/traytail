@@ -53,9 +53,10 @@ type portalWatcher struct {
 	mu          sync.Mutex
 	detected    bool
 	url         string
-	reupNeeded  bool // tailscale was auto-disconnected; re-up on clear
-	streak      int  // consecutive PORTAL readings (hysteresis)
-	clearStreak int  // consecutive CLEAN readings to clear (hysteresis)
+	reupNeeded  bool      // tailscale was auto-disconnected; re-up on clear
+	streak      int       // consecutive PORTAL readings (hysteresis)
+	clearStreak int       // consecutive CLEAN readings to clear (hysteresis)
+	lastClear   time.Time // floor between successful clear→detect cycles
 }
 
 // smartAuto tracks the home/away state machine. It applies the policy
@@ -277,6 +278,12 @@ func (a *app) tickPortal(st *Status) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Detect→clear floor: after a clear, ignore portal readings for a
+	// while (configurable) — flaky uplinks (phone hotspot on a train)
+	// block v4 minutes at a stretch and would ping-pong the UI/AI.
+	if !p.detected && !p.lastClear.IsZero() && clockNow().Sub(p.lastClear) < portalRedetectFloor {
+		return
+	}
 	switch state {
 	case nmConnectivityPortal:
 		// Hysteresis: require consecutive PORTAL readings before
@@ -319,6 +326,7 @@ func (a *app) tickPortal(st *Status) {
 		}
 		p.detected = false
 		p.url = ""
+		p.lastClear = clockNow()
 		if p.reupNeeded && !st.Running() {
 			p.reupNeeded = false
 			log.Printf("traytail: portal cleared -> reconnecting tailscale")

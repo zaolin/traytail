@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
@@ -187,14 +188,15 @@ func selfCheckDNSWall(ctx context.Context) (bool, error) {
 		if aRecordsAreWalled(ctx, server, host) {
 			return true, nil // walled A-records + alive allowlist = portal
 		}
-		// Routing wall: A-resolves but TCP :80 connect fails while the
-		// check domain's :80 works (live-verified on wifionice).
+		// Routing wall: A-resolves but TCP :80 connect fails EVERY
+		// attempt while the check domain's :80 works (live-verified on
+		// wifionice; single-shot reads oscillate on shared NATs).
 		ips, rerr := resolveVia(ctx, server, host)
 		if rerr != nil || len(ips) == 0 {
 			continue
 		}
 		if v4 := firstIPv4Record(ips); v4 != "" {
-			if !tcpPortOpen(ctx, v4, 80) && checkTCPOpen(ctx, server) {
+			if controlWallConsistently(ctx, v4) && checkTCPOpen(ctx, server) {
 				return true, nil
 			}
 		}
@@ -202,7 +204,28 @@ func selfCheckDNSWall(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// firstIPv4Record picks the first IPv4 address of a resolver answer.
+// wallAttempts is how many times each control domain is probed
+// before accepting failure: portals fail ALL attempts (consistent
+// wall), flaky shared NATs (train networks) only miss some. This kills
+// detect/clear oscillation on genuine-but-flaky networks.
+const wallAttempts = 3
+
+// controlWallConsistently probes host's v4 :80 wallAttempts times with
+// short timeouts; true only when EVERY attempt fails (that's a wall,
+// not packet loss).
+func controlWallConsistently(ctx context.Context, ip string) bool {
+	for i := 0; i < wallAttempts; i++ {
+		if tcpPortOpen(ctx, ip, 80) {
+			return false
+		}
+		time.Sleep(wallRetryGap)
+	}
+	return true
+}
+
+// wallRetryGap is a var so tests can shrink it.
+var wallRetryGap = 600 * time.Millisecond
+
 func firstIPv4Record(ips []string) string {
 	for _, ip := range ips {
 		if net.ParseIP(ip).To4() != nil {

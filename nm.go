@@ -333,6 +333,10 @@ func gatewayLoginCandidate() string {
 // before tickPortal acts (protects against single flapping checks).
 var portalHysteresis = 2
 
+// portalRedetectFloor is the dead time after a successful clear
+// before a new detection cycle may start (flaky-uplink ping-pong damper).
+var portalRedetectFloor = time.Minute
+
 // checkPortalReal is the production CheckPortal implementation;
 // CheckPortal is a var (tests stub it, restoreNM re-points here).
 func checkPortalReal(ctx context.Context) (int, string) {
@@ -379,6 +383,7 @@ func portalStateName(s int) string {
 // logWarnf is a seam so nm.go logging stays consistent with the app
 // logger (wired in main.go to log.Printf with the traytail prefix).
 var logWarnf = func(format string, args ...any) {}
+
 // checkEnabledState mirrors the NM setting; refreshed each read
 // (a cheap property call) so test fakes and live changes apply.
 var checkEnabledState = &struct {
