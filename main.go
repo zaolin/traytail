@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"log/syslog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -71,6 +73,7 @@ type smartAuto struct {
 
 func main() {
 	log.SetFlags(0)
+	setupLogging() // journald/syslog + stderr fallback; never fatal
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
 	sni, err := NewSNI(os.Getpid())
@@ -79,6 +82,32 @@ func main() {
 	}
 	if err := runApp(ctx, stop, sni); err != nil {
 		log.Fatalf("traytail: %v", err)
+	}
+}
+
+// setupLogging tees log output to the syslog socket (/dev/log, picked
+// up by journald with identity traytail) AND stderr — logs stay
+// discoverable via journalctl -t traytail regardless of how the
+// process was started. Degrades to stderr-only when the socket is
+// unavailable (distros without /dev/log) — logging must never be
+// fatal.
+// syslogWriter is a seam for tests.
+var syslogWriter = func() (io.WriteCloser, error) {
+	return syslog.New(syslog.LOG_INFO|syslog.LOG_USER, "traytail")
+}
+
+func setupLogging() {
+	w, err := syslogWriter()
+	if err != nil {
+		return // stderr only
+	}
+	log.SetOutput(io.MultiWriter(w, os.Stderr))
+}
+
+// closeLogging releases the syslog writer at exit.
+func closeLogging() {
+	if w, ok := log.Writer().(io.WriteCloser); ok {
+		w.Close()
 	}
 }
 

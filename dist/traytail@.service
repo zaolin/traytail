@@ -1,0 +1,19 @@
+[Unit]
+Description=Tailscale tray icon for SNI bars (traytail)
+Documentation=https://github.com/zaolin/traytail
+Wants=NetworkManager.service
+After=network-online.target NetworkManager.service tailscaled.service
+
+[Service]
+Type=simple
+User=%I
+# fwmark bypass so the captive-portal probes see past an active tunnel
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ExecStart=%bindir%/traytail
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

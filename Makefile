@@ -1,4 +1,4 @@
-.PHONY: build install uninstall test cover vet integration clean
+.PHONY: build install uninstall install-system uninstall-system test cover vet integration clean
 
 GOCOVMERGE := $(shell command -v gocovmerge 2>/dev/null || echo $(HOME)/go/bin/gocovmerge)
 
@@ -17,6 +17,21 @@ install: build
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/traytail
+
+# install-system: binary + systemd template unit for the invoking user.
+# Usage: sudo make install-system USER=$USER
+# Gives the tray CAP_NET_ADMIN (portal probes bypass the tunnel) and
+# journald logging (journalctl -u traytail@USER -f).
+install-system: install
+	@if [ -z "$(USER)" ]; then echo "usage: sudo make install-system USER=<username>" >&2; exit 1; fi
+	sed -e 's|%bindir%|$(BINDIR)|' dist/traytail@.service > $(DESTDIR)/etc/systemd/system/traytail@.service
+	-systemctl daemon-reload
+	-systemctl enable --now traytail@$(USER)
+
+uninstall-system:
+	-systemctl disable --now traytail@$(USER)
+	rm -f $(DESTDIR)/etc/systemd/system/traytail@.service
+	-systemctl daemon-reload
 
 vet:
 	go vet ./...

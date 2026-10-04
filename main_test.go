@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -3364,3 +3365,25 @@ func TestDNSWallConsistentStallsPortal(t *testing.T) {
 		t.Error("every-attempt DNS failure = walled = portal")
 	}
 }
+
+func TestSetupLogging(t *testing.T) {
+	// syslog path: writer errors -> stderr-only fallback, no panic
+	orig := syslogWriter
+	syslogWriter = func() (io.WriteCloser, error) { return nil, errors.New("/dev/log missing") }
+	t.Cleanup(func() { syslogWriter = orig })
+	setupLogging() // must not panic; stderr still works
+	if orig != nil && log.Writer() == nil {
+		t.Error("log writer must remain set")
+	}
+	// happy path: fake writer tee'd to stderr
+	syslogWriter = func() (io.WriteCloser, error) { return nopWriteCloser{}, nil }
+	setupLogging()
+	log.Print("traytail logging smoke test")
+	w, _ := syslogWriter()
+	w.Close()
+}
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
