@@ -337,6 +337,12 @@ var portalHysteresis = 2
 // before a new detection cycle may start (flaky-uplink ping-pong damper).
 var portalRedetectFloor = time.Minute
 
+// portalEvidenceSpan is how long portal-ish evidence must hold
+// UNBROKEN before the portal activates: short NM blips (10–20s during
+// tower handovers) and quick matrix noise fall below it; a real login
+// wall exceeds it. With a 5s tick, 90s = 18 portal-ish readings.
+var portalEvidenceSpan = 90 * time.Second
+
 // checkPortalReal is the production CheckPortal implementation;
 // CheckPortal is a var (tests stub it, restoreNM re-points here).
 func checkPortalReal(ctx context.Context) (int, string) {

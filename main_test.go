@@ -1501,11 +1501,11 @@ func TestMatrixOverridesNMFull(t *testing.T) {
 	restoreIfaceAddrs(t, []string{"172.24.7.111/19"})
 
 	ft := installFakeTailscale(t)
-	obj2 := &fakeNMObj{gateway: "10.1.32.1"}
-	obj2.state = nmConnectivityPortal
-	obj2.checkOn = true
-	obj2.primary = dbus.ObjectPath("/nm/AC")
-	_ = obj2
+	// The dial-serving fake is `obj` (restoreNM's): its stale-portal
+	// state + enabled check is the live wifionice lie.
+	obj.state = nmConnectivityPortal
+	obj.checkOn = true
+	obj.primary = dbus.ObjectPath("/org/freedesktop/NetworkManager/ActiveConnection/1")
 
 	a := newTestApp(t, &fakeUI{})
 	// matrix cache reset
@@ -1520,8 +1520,14 @@ func TestMatrixOverridesNMFull(t *testing.T) {
 	// but primaryGateway resolves via fake: gateway reachable? —
 	// appleCheck uses probeHTTPDo (clean), DNS-wall fires.
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}}
-	a.tickPortal(st) // arm
-	a.tickPortal(st) // fire
+	// Evidence must span BOTH: matrixStreakNeeded(3) walled runs AND
+	// the unbroken-evidence time span. Freeze the clock and advance it
+	// per run like real 30s matrix intervals would.
+	restoreMatrixFast(t)
+	advance := fakeClockFrozen(t)
+	a.tickPortal(st) // matrix run 1: wall evidence starts
+	advance(portalEvidenceSpan)
+	a.tickPortal(st) // span complete -> activate
 	if detected, url := a.portalInfo(); !detected {
 		t.Fatalf("matrix must override NM FULL (portal not detected)")
 	} else if url != "" && url != "http://10.1.32.1/" && url != "http://10.240.93.149/" {
@@ -1534,10 +1540,13 @@ func TestTickPortalSelfProbeDetectsThroughTunnel(t *testing.T) {
 	ft := installFakeTailscale(t)
 	a := newTestApp(t, &fakeUI{})
 	a.smart = &smartAuto{primed: true}
+	restoreMatrixFast(t)
 	obj := restoreNM(t, nmConnectivityFull, "http://check/x", "", nil)
 	_ = obj
-	// disable NM check -> self-probe must take over
+	// disable NM check -> self-probe must take over. NM's cached
+	// verdict is stale-portal (the check can't refresh it).
 	obj.checkOn = false
+	obj.state = nmConnectivityPortal
 
 	// self-probe sees a redirect (the actual portal)
 	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
@@ -1548,9 +1557,11 @@ func TestTickPortalSelfProbeDetectsThroughTunnel(t *testing.T) {
 		BackendState: "Running",
 		Peer:         map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}, // tunnel active
 	}
+	advance := fakeClockFrozen(t)
 
-	a.tickPortal(st) // arm (hysteresis)
-	a.tickPortal(st) // fire: disconnect
+	a.tickPortal(st) // matrix run 1 (evidence clock starts)
+	advance(portalEvidenceSpan + time.Second)
+	a.tickPortal(st) // evidence span complete -> activate: disconnect
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
@@ -1580,12 +1591,14 @@ func TestTickPortalSelfProbeClearReups(t *testing.T) {
 
 	st := &Status{BackendState: "Running", Peer: map[string]Peer{"mv": mvPeer("de-ber-wg-001", true)}}
 
-	// detect through the tunnel
+	// detect through the tunnel (evidence span + activation)
 	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
 		return respWith(302, "http://portal/login", "", ""), nil
 	})
+	advance := fakeClockFrozen(t)
 	a.tickPortal(st)
-	a.tickPortal(st)
+	advance(portalEvidenceSpan + time.Second)
+	a.tickPortal(st) // activate
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
@@ -1595,8 +1608,9 @@ func TestTickPortalSelfProbeClearReups(t *testing.T) {
 	restoreSelfProbe(t, "172.24.7.111", func(*http.Request) (*http.Response, error) {
 		return respWith(204, "", "", ""), nil
 	})
-	a.tickPortal(&Status{BackendState: "Stopped"}) // clear streak 1 (hysteresis)
-	a.tickPortal(&Status{BackendState: "Stopped"}) // clear streak 2 -> re-up
+	a.tickPortal(&Status{BackendState: "Stopped"}) // clear: invalidates stale cache
+	a.tickPortal(&Status{BackendState: "Stopped"}) // fresh clear run: streak 1
+	a.tickPortal(&Status{BackendState: "Stopped"}) // streak 2 -> re-up
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) < 2 {
 		time.Sleep(5 * time.Millisecond)
@@ -1868,15 +1882,22 @@ func TestPortalStateNames(t *testing.T) {
 func TestTickPortalDisconnectsOnPortal(t *testing.T) {
 	ft := installFakeTailscale(t)
 	a := newTestApp(t, &fakeUI{})
+	restoreMatrixFast(t)
+	// Matrix inert: no bind interface available → selfCheckPortalFull
+	// can't run; NM's PORTAL verdict drives the hysteresis path.
+	restoreIfaceAddrs(t, nil)
 	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	a.smart = &smartAuto{primed: true}
 	st := &Status{BackendState: "Running"}
+	advance := fakeClockFrozen(t)
 
-	a.tickPortal(st) // arms (hysteresis streak 1), no action yet
+	a.tickPortal(st) // arm (evidence clock starts)
 	if detected, _ := a.portalInfo(); detected {
 		t.Error("single portal reading must not trigger detection (hysteresis)")
 	}
-	a.tickPortal(st) // second reading -> detect + disconnect
+	// advance past the evidence span: second reading activates
+	advance(portalEvidenceSpan + time.Second)
+	a.tickPortal(st) // detect + disconnect
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(ft.callsSoFar(t)) == 0 {
 		time.Sleep(5 * time.Millisecond)
@@ -1957,7 +1978,9 @@ func TestTickPortalReupsOnClear(t *testing.T) {
 	restoreMatrixFast(t)
 	restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	st := &Status{BackendState: "Running"}
-	a.tickPortal(st) // arm (hysteresis)
+	advance := fakeClockFrozen(t)
+	a.tickPortal(st) // arm (evidence starts)
+	advance(portalEvidenceSpan + time.Second)
 	a.tickPortal(st) // detect + disconnect + mark reup
 
 	// clear: NM says full; tailscale still reports Stopped (down happened)
@@ -2194,11 +2217,15 @@ func TestHysteresisConfigurable(t *testing.T) {
 	a := newTestApp(t, &fakeUI{})
 	obj := restoreNM(t, nmConnectivityPortal, "http://check/x", "http://portal/login", nil)
 	obj.state = nmConnectivityPortal
+	// matrix inert: no bind iface — the NM-verdict hysteresis path
+	restoreIfaceAddrs(t, nil)
 	st := &Status{BackendState: "Running"}
+	advance := fakeClockFrozen(t)
 
 	portalHysteresis = 3
-	a.tickPortal(st) // streak 1
-	a.tickPortal(st) // streak 2
+	a.tickPortal(st) // streak 1: arm + evidence starts
+	advance(portalEvidenceSpan + time.Second)
+	a.tickPortal(st) // streak 2: span ok but hysteresis not met
 	if detected, _ := a.portalInfo(); detected {
 		t.Error("streak 2 must not trigger with hysteresis 3")
 	}
@@ -3288,11 +3315,18 @@ func TestMatrixCacheTTL(t *testing.T) {
 	t.Cleanup(func() { realDial = origReal })
 
 	// matrix runs are gated: a run with no NM errors -> verdict false
-	ok, url, fresh := (&app{}).matrixVerdict()
+	ok, url, _, fresh := (&app{}).matrixVerdict()
 	t.Logf("first: %v %q fresh=%v", ok, url, fresh)
-	ok2, _, fresh2 := (&app{}).matrixVerdict()
-	// within interval: cached result, still "fresh" only if first run said so
+	ok2, _, _, fresh2 := (&app{}).matrixVerdict()
+	// within interval: cached; fresh only on the consuming call right
+	// after a run — the second call sees fresh=false
 	t.Logf("second: ok=%v fresh=%v", ok2, fresh2)
+	if fresh != true {
+		t.Error("first call should run the matrix fresh")
+	}
+	if fresh2 != false {
+		t.Error("cached call within interval must not be fresh")
+	}
 	resetMatrixState()
 }
 
@@ -3367,23 +3401,49 @@ func TestDNSWallConsistentStallsPortal(t *testing.T) {
 }
 
 func TestSetupLogging(t *testing.T) {
-	// syslog path: writer errors -> stderr-only fallback, no panic
 	orig := syslogWriter
+	t.Cleanup(func() {
+		syslogWriter = orig
+		setupLogging()
+	})
+	// syslog path: writer errors -> stderr-only fallback, no panic
 	syslogWriter = func() (io.WriteCloser, error) { return nil, errors.New("/dev/log missing") }
-	t.Cleanup(func() { syslogWriter = orig })
-	setupLogging() // must not panic; stderr still works
-	if orig != nil && log.Writer() == nil {
-		t.Error("log writer must remain set")
+	setupLogging()
+	if w := log.Writer(); !isStderr(w) {
+		t.Errorf("fallback writer should be os.Stderr, got %T", w)
 	}
-	// happy path: fake writer tee'd to stderr
-	syslogWriter = func() (io.WriteCloser, error) { return nopWriteCloser{}, nil }
+	// happy path: the writer IS the output (dropping stderr to avoid
+	// doubled journal lines; capture to verify routing)
+	fake := &captureWriteCloser{}
+	syslogWriter = func() (io.WriteCloser, error) { return fake, nil }
 	setupLogging()
 	log.Print("traytail logging smoke test")
+	if got := fake.buf.String(); !strings.Contains(got, "smoke test") {
+		t.Errorf("log output missing from syslog writer: %q", got)
+	}
 	w, _ := syslogWriter()
 	w.Close()
 }
 
-type nopWriteCloser struct{}
+// isStderr compares the log writer against os.Stderr by fd identity.
+func isStderr(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	return ok && f == os.Stderr
+}
 
-func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
-func (nopWriteCloser) Close() error                { return nil }
+type captureWriteCloser struct {
+	buf strings.Builder
+}
+
+func (c *captureWriteCloser) Write(p []byte) (int, error) { return c.buf.Write(p) }
+func (c *captureWriteCloser) Close() error                { return nil }
+
+// fakeClockFrozen pins clockNow at a base time; advance() moves it.
+func fakeClockFrozen(t *testing.T) func(advance time.Duration) {
+	t.Helper()
+	orig := clockNow
+	base := time.Now()
+	clockNow = func() time.Time { return base }
+	t.Cleanup(func() { clockNow = orig })
+	return func(d time.Duration) { base = base.Add(d) }
+}

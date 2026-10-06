@@ -52,13 +52,14 @@ type app struct {
 // portalWatcher tracks NetworkManager connectivity and the captive
 // portal login URL discovered from the hijacked connectivity check.
 type portalWatcher struct {
-	mu          sync.Mutex
-	detected    bool
-	url         string
-	reupNeeded  bool      // tailscale was auto-disconnected; re-up on clear
-	streak      int       // consecutive PORTAL readings (hysteresis)
-	clearStreak int       // consecutive CLEAN readings to clear (hysteresis)
-	lastClear   time.Time // floor between successful clear→detect cycles
+	mu            sync.Mutex
+	detected      bool
+	url           string
+	reupNeeded    bool      // tailscale was auto-disconnected; re-up on clear
+	streak        int       // consecutive PORTAL readings (hysteresis)
+	clearStreak   int       // consecutive CLEAN readings to clear (hysteresis)
+	lastClear     time.Time // floor between successful clear→detect cycles
+	evidenceFirst time.Time // first unbroken portal-ish reading (activation span)
 }
 
 // smartAuto tracks the home/away state machine. It applies the policy
@@ -86,11 +87,11 @@ func main() {
 }
 
 // setupLogging tees log output to the syslog socket (/dev/log, picked
-// up by journald with identity traytail) AND stderr — logs stay
-// discoverable via journalctl -t traytail regardless of how the
-// process was started. Degrades to stderr-only when the socket is
-// unavailable (distros without /dev/log) — logging must never be
-// fatal.
+// up by journald with identity traytail). When syslog IS available,
+// stderr is dropped: under systemd, stderr also lands in the journal,
+// which would double every line. Degrades to stderr-only when the
+// socket is unavailable (distros without /dev/log) — logging must
+// never be fatal.
 // syslogWriter is a seam for tests.
 var syslogWriter = func() (io.WriteCloser, error) {
 	return syslog.New(syslog.LOG_INFO|syslog.LOG_USER, "traytail")
@@ -101,7 +102,7 @@ func setupLogging() {
 	if err != nil {
 		return // stderr only
 	}
-	log.SetOutput(io.MultiWriter(w, os.Stderr))
+	log.SetOutput(w) // syslog only: systemd mirrors stderr to the journal -> doubles
 }
 
 // closeLogging releases the syslog writer at exit.
@@ -281,59 +282,106 @@ func (a *app) smartTarget(home bool, st *Status) string {
 // traffic can't reach the hijacking portal) and remember to re-up;
 // when the portal clears, bring tailscale back up.
 //
-// Detection runs two probe sets:
-//   - NM's verdict (throttled fresh CheckConnectivity + cached read)
-//   - the self-probe set, ALWAYS: check-URI + Apple body + DNS-wall
-//     matrix (walled-garden portals like wifionice allowlist the
-//     check domains and keep IPv6 open — NM's "FULL" lies there, so
-//     it only triggers fast and can never veto the matrix)
+// Evidence model (single pipeline — no separate NM fast path):
+// every tick contributes a reading to an evidence register:
+//   - "portal-ish": NM reports PORTAL (its own blip-on-handover
+//     included) or the matrix's walled run
+//   - "clear": NM FULL/LIMITED and/or a matrix clean run
+//
+// The portal ACTIVATES only when portal-ish evidence spans
+// portalEvidenceSpan WITHOUT a single clear reading in between.
+// Train tower-handovers blip NM to PORTAL for 10–20s — far below the
+// span — so they never fire; a real login wall (minutes) does. The
+// matrix runs on its 30s interval; NM's per-tick readings keep the
+// register dense between matrix runs.
+//
+// Clear-side: unchanged 2-clean-tick hysteresis + 60s redetect floor.
 func (a *app) tickPortal(st *Status) {
 	p := &a.portal
 	nmState, nmURL := CheckPortal(context.Background())
-	matrixPortal, matrixURL, matrixFresh := a.matrixVerdict()
+	matrixPortal, matrixURL, matrixWalled, _ := a.matrixVerdict()
 
-	state, url := nmState, nmURL
+	// Determine this tick's raw reading.
+	reading := nmState
+	url := nmURL
 	if matrixPortal {
-		// The matrix is the trusted signal: walled-garden portals keep
-		// NM's check path reachable by design.
-		state = nmConnectivityPortal
+		reading = nmConnectivityPortal
 		if matrixURL != "" {
 			url = matrixURL
 		}
-	} else if matrixFresh {
-		// A fresh matrix clear downgrades NM when NM's own view can't
-		// be trusted: FULL from an allowlist-deceivable check path, or
-		// a stale PORTAL from a disabled check (nothing re-probed).
+	} else if matrixWalled && matrixURL != "" {
+		// Matrix run was walled (streak accumulating): its URL — the
+		// redirect/portal discovered by the self-probe — beats the
+		// gateway-fallback URL the gate may have produced.
+		url = matrixURL
+	} else if !matrixPortal && !matrixWalled {
+		// Matrix says NOT-walled (fresh run, or a cached clear while
+		// the portal state must still be able to recover). Downgrade
+		// NM when its own view can't be trusted: FULL from an
+		// allowlist-deceivable check path, or stale PORTAL from a
+		// disabled check (nothing re-probed). A fresh WALLED run never
+		// downgrades — it IS the portal signal.
 		if nmState == nmConnectivityFull && nmMatrixOverride() {
-			state = nmConnectivityFull
+			reading = nmConnectivityFull
 		} else if nmState == nmConnectivityPortal && !nmCheckEnabledCached() {
-			state = nmConnectivityFull // stale PORTAL, check disabled
+			reading = nmConnectivityFull
 		}
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Detect→clear floor: after a clear, ignore portal readings for a
-	// while (configurable) — flaky uplinks (phone hotspot on a train)
-	// block v4 minutes at a stretch and would ping-pong the UI/AI.
-	if !p.detected && !p.lastClear.IsZero() && clockNow().Sub(p.lastClear) < portalRedetectFloor {
-		return
-	}
-	switch state {
-	case nmConnectivityPortal:
-		// Hysteresis: require consecutive PORTAL readings before
-		// acting, so a single flapping check can't bounce tailscale.
-		p.streak++
-		if !p.detected && p.streak < portalHysteresis {
-			return // arm the detection, act when the streak completes
+
+	// When the portal has been acted on (downed) and tailscale is
+	// stopped, a CACHED walled verdict must not block recovery: the
+	// wall has to re-prove itself with fresh runs. Invalidate the
+	// cache so the next tick re-runs the matrix.
+	if p.detected && !st.Running() {
+		matrixState.mu.Lock()
+		if clockNow().Sub(matrixState.lastRun) >= matrixInterval {
+			// stale anyway; nothing to do
+		} else {
+			// within interval but the world has changed: force re-run
+			matrixState.lastRun = time.Time{}
 		}
+		matrixState.mu.Unlock()
+	}
+
+	switch reading {
+	case nmConnectivityPortal:
+		p.streak++ // one portal-ish tick
 		if !p.detected {
-			p.detected = true
+			// Evidence accumulates; two activation conditions BOTH
+			// required: unbroken span >= portalEvidenceSpan AND enough
+			// ticks (portalHysteresis), whichever is longer in practice.
+			spanOK := !p.evidenceFirst.IsZero() &&
+				clockNow().Sub(p.evidenceFirst) >= portalEvidenceSpan
+			ticksOK := p.streak >= portalHysteresis
+			if spanOK && ticksOK {
+				// long unbroken portal-ish evidence: activate
+				p.detected = true
+				p.url = url
+				p.clearStreak = 0
+				log.Printf("traytail: captive portal detected (%s) after %.0fs of consistent evidence, url=%q",
+					portalStateName(reading), clockNow().Sub(p.evidenceFirst).Seconds(), url)
+				if st.Running() {
+					log.Printf("traytail: portal active -> disconnecting tailscale")
+					if err := Disconnect(context.Background()); err != nil {
+						log.Printf("traytail: portal disconnect: %v", err)
+					}
+					p.reupNeeded = true
+				}
+				return
+			}
+			// accumulate evidence; a first reading starts the span clock
+			if p.evidenceFirst.IsZero() {
+				p.evidenceFirst = clockNow()
+				log.Printf("traytail: portal-ish signal — accumulating evidence")
+			}
+			return
+		}
+		// already detected: refresh URL if newly discovered
+		if p.url == "" && url != "" {
 			p.url = url
-			p.clearStreak = 0
-			log.Printf("traytail: captive portal detected (%s), url=%q", portalStateName(state), url)
-		} else if p.url == "" && url != "" {
-			p.url = url // retry found the login URL
 			log.Printf("traytail: portal login URL discovered: %q", url)
 		}
 		if st.Running() {
@@ -344,23 +392,30 @@ func (a *app) tickPortal(st *Status) {
 			p.reupNeeded = true
 		}
 	case nmConnectivityFull, nmConnectivityLimited:
-		p.streak = 0
-		if !p.detected && !p.reupNeeded {
-			return // nothing to clear
+		// Any clear reading kills pending evidence (blip ends).
+		if !p.detected {
+			if !p.evidenceFirst.IsZero() && p.streak > 0 {
+				log.Printf("traytail: portal evidence invalidated after %.0fs (blip, not a portal)",
+					clockNow().Sub(p.evidenceFirst).Seconds())
+			}
+			p.evidenceFirst = time.Time{}
+			p.streak = 0
+			p.clearStreak = 0
+			return
 		}
-		// Clear-hysteresis: require consecutive CLEAN verdicts before
-		// clearing, mirroring the detection streak — the walled matrix
-		// oscillates on flaky train networks.
+		// Detected: require consecutive CLEAN ticks before clearing.
+		p.streak = 0
 		p.clearStreak++
 		if p.clearStreak < portalHysteresis {
 			return
 		}
 		p.clearStreak = 0
 		if p.detected {
-			log.Printf("traytail: portal cleared (%s)", portalStateName(state))
+			log.Printf("traytail: portal cleared (%s)", portalStateName(reading))
 		}
 		p.detected = false
 		p.url = ""
+		p.evidenceFirst = time.Time{}
 		p.lastClear = clockNow()
 		if p.reupNeeded && !st.Running() {
 			p.reupNeeded = false
@@ -381,38 +436,63 @@ func (a *app) tickPortal(st *Status) {
 // Var so tests can shrink it (restoreMatrixFast).
 var matrixInterval = 30 * time.Second
 
-// matrixState caches the last matrix verdict.
+// matrixState caches the last matrix verdict plus the portal-streak
+// evidence across runs: a portal ACTIVATION needs matrixStreakNeeded
+// consecutive walled runs (~90–120s of evidence) — train-WiFi v4
+// blips last 20–90s and are shorter than a real portal.
 var matrixState struct {
-	mu      sync.Mutex
-	portal  bool
-	url     string
-	fresh   bool // verdict came from THIS interval's run
-	lastRun time.Time
+	mu         sync.Mutex
+	portal     bool
+	walled     bool // last raw matrix run said walled (pre-streak)
+	url        string
+	fresh      bool // verdict came from THIS interval's run
+	lastRun    time.Time
+	wallStreak int // consecutive walled matrix runs
 }
+
+// matrixStreakNeeded is how many consecutive walled matrix runs
+// activate the portal state (evidence spanning ~90s+).
+var matrixStreakNeeded = 3
 
 // resetMatrixState clears the cached matrix verdict (tests).
 func resetMatrixState() {
 	matrixState.mu.Lock()
 	matrixState.portal, matrixState.url, matrixState.fresh = false, "", false
 	matrixState.lastRun = time.Time{}
+	matrixState.wallStreak = 0
 	matrixState.mu.Unlock()
 }
 
-// matrixVerdict returns the cached-or-fresh matrix verdict.
-// (portal, url, freshThisInterval)
-func (a *app) matrixVerdict() (bool, string, bool) {
+// matrixVerdict returns the accumulated matrix verdict:
+// (portalActive, url, rawWalled, freshThisInterval). portalActive
+// requires matrixStreakNeeded CONSECUTIVE walled runs; a single clean
+// run resets the streak (blip). rawWalled = the LAST RUN's verdict
+// (even when the streak hasn't activated yet) — used to decide
+// whether NM's readings can be downgraded.
+func (a *app) matrixVerdict() (bool, string, bool, bool) {
 	matrixState.mu.Lock()
 	defer matrixState.mu.Unlock()
 	now := clockNow()
 	if now.Sub(matrixState.lastRun) < matrixInterval {
-		return matrixState.portal, matrixState.url, matrixState.fresh
+		// cached: NOT fresh — fresh means "a run finished during this
+		// tick" so arm/downgrade rules only react to real runs.
+		matrixState.fresh = false
+		return matrixState.portal, matrixState.url, matrixState.walled, false
 	}
 	// run serialized under the lock (single poller thread — no
 	// contention; keeps tick/clear verdicts consistent)
 	matrixState.lastRun = now
 	ok, url := selfCheckPortalFull(context.Background(), &Status{BackendState: "Running"})
-	matrixState.portal, matrixState.url, matrixState.fresh = ok, url, true
-	return ok, url, true
+	matrixState.walled = ok
+	if ok {
+		matrixState.wallStreak++
+	} else {
+		matrixState.wallStreak = 0
+	}
+	matrixState.portal = matrixState.wallStreak >= matrixStreakNeeded
+	matrixState.url = url
+	matrixState.fresh = true
+	return matrixState.portal, matrixState.url, ok, true
 }
 
 // nmMatrixOverride gates the downgrade of an NM FULL by a fresh
