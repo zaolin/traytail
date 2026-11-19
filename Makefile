@@ -24,9 +24,10 @@ uninstall:
 # journald logging (journalctl -u traytail@USER -f).
 install-system: install
 	@if [ -z "$(USER)" ]; then echo "usage: sudo make install-system USER=<username>" >&2; exit 1; fi
-	sed -e 's|%bindir%|$(BINDIR)|' dist/traytail@.service > $(DESTDIR)/etc/systemd/system/traytail@.service
-	-systemctl daemon-reload
-	-systemctl enable --now traytail@$(USER)
+	sed -e 's|/usr/local/bin/traytail|$(BINDIR)/traytail|' dist/traytail@.service > $(DESTDIR)/etc/systemd/system/traytail@.service
+	systemctl daemon-reload
+	systemctl enable traytail@$(USER)
+	systemctl restart traytail@$(USER) # load the just-installed binary into the running service
 
 uninstall-system:
 	-systemctl disable --now traytail@$(USER)

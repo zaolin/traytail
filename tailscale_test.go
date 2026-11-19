@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // fakeTailscale installs a shell-script `tailscale` on a temp PATH that
@@ -64,6 +67,56 @@ func (ft *fakeTailscale) setFail(t *testing.T) {
 	}
 }
 
+// blockAction makes one CLI subcommand wait on a FIFO. Cancellation
+// should kill the blocked process; tests can release it explicitly when
+// demonstrating that cancellation was ignored.
+func (ft *fakeTailscale) blockAction(t *testing.T, action string) string {
+	t.Helper()
+	path := filepath.Join(ft.dir, "block-"+action)
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func (ft *fakeTailscale) waitForAction(t *testing.T, action string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, call := range ft.callsSoFar(t) {
+			if len(call) > 0 && call[0] == action {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("tailscale %s was not called", action)
+}
+
+func releaseBlockedAction(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, syscall.ENXIO) {
+		return // the cancelled reader has already exited
+	}
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Error(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestReleaseBlockedActionWithoutReader(t *testing.T) {
+	ft := &fakeTailscale{dir: t.TempDir()}
+	gate := ft.blockAction(t, "down")
+	releaseBlockedAction(t, gate)
+}
+
 // setDebugPrefs writes the canned `tailscale debug prefs` JSON. An
 // empty string omits the file, so `cat` yields nothing (parse fails).
 func (ft *fakeTailscale) setDebugPrefs(t *testing.T, prefsJSON string) {
@@ -89,6 +142,7 @@ func (ft *fakeTailscale) rewriteScript(t *testing.T) {
 	}
 	cli := filepath.Join(binDir, "tailscale")
 	script := "#!/bin/sh\necho \"$@\" >> " + ft.logPath + "\n" +
+		"if [ -p " + filepath.Join(ft.dir, "block-$1") + " ]; then read _ < " + filepath.Join(ft.dir, "block-$1") + "; fi\n" +
 		"if [ \"$1\" = \"debug\" ]; then if [ -f " + filepath.Join(ft.dir, "prefs.json") + " ]; then cat " + filepath.Join(ft.dir, "prefs.json") + "; else echo '{}'; fi; exit 0; fi\n" +
 		"if [ -f " + filepath.Join(ft.dir, "fail") + " ]; then echo 'simulated cli failure' >&2; exit 1; fi\n" +
 		"cat " + filepath.Join(ft.dir, "resp.txt") + " 2>/dev/null || true\n"

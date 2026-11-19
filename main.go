@@ -45,8 +45,13 @@ type app struct {
 	smart       *smartAuto
 	execCommand func(string, ...string) *exec.Cmd // nil = global execCommand
 
-	// captive-portal state
-	portal portalWatcher
+	// captive-portal state. Probes run asynchronously: the first menu
+	// update must never wait on a captive network.
+	portal     portalWatcher
+	portalCh   chan *Status // latest status for the portal worker
+	portalCtx  context.Context
+	portalStop context.CancelFunc
+	portalWG   sync.WaitGroup
 }
 
 // portalWatcher tracks NetworkManager connectivity and the captive
@@ -75,6 +80,7 @@ type smartAuto struct {
 func main() {
 	log.SetFlags(0)
 	setupLogging() // journald/syslog + stderr fallback; never fatal
+	mustSingleInstance()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
 	sni, err := NewSNI(os.Getpid())
@@ -105,23 +111,18 @@ func setupLogging() {
 	log.SetOutput(w) // syslog only: systemd mirrors stderr to the journal -> doubles
 }
 
-// closeLogging releases the syslog writer at exit.
-func closeLogging() {
-	if w, ok := log.Writer().(io.WriteCloser); ok {
-		w.Close()
-	}
-}
-
 // runApp runs the poll loop until ctx is cancelled (signal or Quit item).
-// It owns the SNI connection for the duration.
+// It owns the SNI connection and portal worker for the duration.
 func runApp(ctx context.Context, stop context.CancelFunc, sni trayUI) error {
 	defer sni.Close()
-	a := &app{ctx: ctx, stop: stop, sni: sni, refreshCh: make(chan struct{}, 1), smart: &smartAuto{}}
+	a := &app{ctx: ctx, stop: stop, sni: sni, refreshCh: make(chan struct{}, 1), smart: &smartAuto{}, portalCh: make(chan *Status, 1)}
+	a.startPortalWorker()
+	defer a.stopPortalWorker()
 	a.registerLoop()
 	if st, err := GetStatus(ctx); err == nil {
 		a.tickSmartAutoStartup(st, true) // startup: observe only, never apply
 	}
-	a.refresh() // initial state
+	a.refresh() // initial state; no portal probe is run inline
 
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
@@ -161,7 +162,7 @@ func (a *app) refresh() {
 	}
 	profiles, _ := GetProfiles(a.ctx)
 
-	a.tickPortal(st)
+	a.queuePortalProbe(st)
 	a.tickSmartAuto(st)
 
 	icon, tooltip, items := a.buildUI(st, profiles)
@@ -173,8 +174,51 @@ func (a *app) refresh() {
 	a.sni.Update(icon, tooltip, items)
 }
 
-// tickSmartAuto runs the home/away state machine. desiredTarget
-// returns the exit node hostname to apply when the state flips.
+// startPortalWorker starts the background portal evaluator. Network
+// evidence is gathered here, outside the UI loop, so a slow portal or
+// dead resolver never delays the icon/menu.
+func (a *app) startPortalWorker() {
+	a.portalCtx, a.portalStop = context.WithCancel(a.ctx)
+	a.portalWG.Add(1)
+	go func() {
+		defer a.portalWG.Done()
+		for {
+			select {
+			case <-a.portalCtx.Done():
+				return
+			case st := <-a.portalCh:
+				a.tickPortal(a.portalCtx, st)
+			}
+		}
+	}()
+}
+
+func (a *app) stopPortalWorker() {
+	a.portalStop()
+	a.portalWG.Wait()
+}
+
+// queuePortalProbe hands the latest status to the portal worker.
+// Only one job is queued: an old status is discarded if a probe is
+// already running. refresh() must remain cheap and non-blocking.
+func (a *app) queuePortalProbe(st *Status) {
+	if a.portalCh == nil {
+		return // tests can call tickPortal directly
+	}
+	select {
+	case a.portalCh <- st:
+	default:
+		// channel occupied: replace it with the latest status
+		select {
+		case <-a.portalCh:
+		default:
+		}
+		select {
+		case a.portalCh <- st:
+		default:
+		}
+	}
+}
 func (a *app) tickSmartAuto(st *Status) {
 	a.tickSmartAutoStartup(st, false)
 }
@@ -230,11 +274,15 @@ func (a *app) tickSmartAutoStartup(st *Status, startup bool) {
 
 // applySmartTarget resolves the policy exit node for the given home
 // state and applies it. Must be called WITHOUT s.mu held: it runs CLI
-// commands and updates the last-used Mullvad record.
+// commands and updates the last-used Mullvad record. If the target is
+// already active, no CLI call is made.
 func (a *app) applySmartTarget(home bool, st *Status) {
 	target := a.smartTarget(home, st)
 	if target == "" {
 		log.Printf("traytail: smart auto: no target for home=%v, keeping current", home)
+		return
+	}
+	if exitMatchesTarget(st, target) {
 		return
 	}
 	if s := a.smart; s != nil {
@@ -246,6 +294,17 @@ func (a *app) applySmartTarget(home bool, st *Status) {
 	if err := SetExitNode(context.Background(), target); err != nil {
 		log.Printf("traytail: smart auto: set exit node: %v", err)
 	}
+}
+
+// exitMatchesTarget reports whether the current exit peer is already
+// the requested target, avoiding a redundant `tailscale set` call.
+// Match both the DNS base name and the user-facing HostName.
+func exitMatchesTarget(st *Status, target string) bool {
+	e := st.ExitNodePeer()
+	if e == nil {
+		return false
+	}
+	return target != "" && (e.BaseName() == target || e.HostName == target)
 }
 
 // smartTarget resolves the policy exit node for the given home state:
@@ -296,10 +355,10 @@ func (a *app) smartTarget(home bool, st *Status) string {
 // register dense between matrix runs.
 //
 // Clear-side: unchanged 2-clean-tick hysteresis + 60s redetect floor.
-func (a *app) tickPortal(st *Status) {
+func (a *app) tickPortal(ctx context.Context, st *Status) {
 	p := &a.portal
-	nmState, nmURL := CheckPortal(context.Background())
-	matrixPortal, matrixURL, matrixWalled, _ := a.matrixVerdict()
+	nmState, nmURL := CheckPortal(ctx)
+	matrixPortal, matrixURL, matrixWalled, _ := a.matrixVerdict(ctx)
 
 	// Determine this tick's raw reading.
 	reading := nmState
@@ -323,7 +382,7 @@ func (a *app) tickPortal(st *Status) {
 		// downgrades — it IS the portal signal.
 		if nmState == nmConnectivityFull && nmMatrixOverride() {
 			reading = nmConnectivityFull
-		} else if nmState == nmConnectivityPortal && !nmCheckEnabledCached() {
+		} else if nmState == nmConnectivityPortal && !nmCheckEnabledCached(ctx) {
 			reading = nmConnectivityFull
 		}
 	}
@@ -365,7 +424,7 @@ func (a *app) tickPortal(st *Status) {
 					portalStateName(reading), clockNow().Sub(p.evidenceFirst).Seconds(), url)
 				if st.Running() {
 					log.Printf("traytail: portal active -> disconnecting tailscale")
-					if err := Disconnect(context.Background()); err != nil {
+					if err := Disconnect(ctx); err != nil {
 						log.Printf("traytail: portal disconnect: %v", err)
 					}
 					p.reupNeeded = true
@@ -386,7 +445,7 @@ func (a *app) tickPortal(st *Status) {
 		}
 		if st.Running() {
 			log.Printf("traytail: portal active -> disconnecting tailscale")
-			if err := Disconnect(context.Background()); err != nil {
+			if err := Disconnect(ctx); err != nil {
 				log.Printf("traytail: portal disconnect: %v", err)
 			}
 			p.reupNeeded = true
@@ -420,7 +479,7 @@ func (a *app) tickPortal(st *Status) {
 		if p.reupNeeded && !st.Running() {
 			p.reupNeeded = false
 			log.Printf("traytail: portal cleared -> reconnecting tailscale")
-			if err := Connect(context.Background()); err != nil {
+			if err := Connect(ctx); err != nil {
 				log.Printf("traytail: portal reconnect: %v", err)
 			}
 			return
@@ -469,7 +528,7 @@ func resetMatrixState() {
 // run resets the streak (blip). rawWalled = the LAST RUN's verdict
 // (even when the streak hasn't activated yet) — used to decide
 // whether NM's readings can be downgraded.
-func (a *app) matrixVerdict() (bool, string, bool, bool) {
+func (a *app) matrixVerdict(ctx context.Context) (bool, string, bool, bool) {
 	matrixState.mu.Lock()
 	defer matrixState.mu.Unlock()
 	now := clockNow()
@@ -482,7 +541,7 @@ func (a *app) matrixVerdict() (bool, string, bool, bool) {
 	// run serialized under the lock (single poller thread — no
 	// contention; keeps tick/clear verdicts consistent)
 	matrixState.lastRun = now
-	ok, url := selfCheckPortalFull(context.Background(), &Status{BackendState: "Running"})
+	ok, url := selfCheckPortalFull(ctx, &Status{BackendState: "Running"})
 	matrixState.walled = ok
 	if ok {
 		matrixState.wallStreak++
@@ -1100,14 +1159,22 @@ func splitMullvad(host string) (cc, city string) {
 }
 
 // menuPortal is shown while a captive portal is active: open the
+// menuPortal is shown while a captive portal is active: open the
 // login page, retry the check manually, switch accounts, or quit.
+// With no redirect URL, use the gateway only if one was discovered —
+// never offer a host the matrix has already proved unreachable.
 func (a *app) menuPortal(st *Status, url string, profiles []Profile) []MenuItem {
 	items := []MenuItem{mk("Wi-Fi captive portal detected", nil), mkSep()}
-	if url != "" {
-		u := url
-		items = append(items, mk("Open portal login", func() { openPortal(u) }))
-	} else {
+	label := "Open portal login"
+	u := url
+	if u == "" {
+		u = gatewayLoginCandidate()
+		label += " (gateway)"
+	}
+	if u == "" {
 		items = append(items, mk("No login URL discovered yet", nil))
+	} else {
+		items = append(items, mk(label, func() { openPortal(u) }))
 	}
 	items = append(items, mk("Retry connectivity check", func() {
 		state, u := CheckPortal(context.Background())

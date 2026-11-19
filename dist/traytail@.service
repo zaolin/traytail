@@ -11,7 +11,7 @@ User=%I
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=true
-ExecStart=%bindir%/traytail
+ExecStart=/usr/local/bin/traytail
 Restart=on-failure
 RestartSec=5
 

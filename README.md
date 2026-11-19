@@ -83,8 +83,17 @@ Detection details and hardening:
   (NM's own retry interval defaults to 300s) so a newly joined portal
   is noticed within ~60s instead of 5; between triggers the cached
   verdict is read.
-- Two consecutive `PORTAL` readings are required before tailscale is
-  disconnected (flap protection).
+- **Portal activation is slow and deliberate**: tailscale is only
+  disconnected after an unbroken portal-ish reading lasting ~90s (and
+  the required tick count). Any clear reading resets the evidence.
+  Tower handovers and phone-hotspot flaps therefore do not cause
+  down/up churn.
+- **No portal verdict from DNS alone**: ad-filtering resolvers
+  (Pi-hole, AdGuard, enterprise policy DNS) can NXDOMAIN the control
+  domains while normal internet works. A usable control A record plus
+  a consistently blocked TCP :80 connection, while the allowlisted
+  check domain remains reachable, is required for the walled-garden
+  verdict.
 - Portals serve their login page in two shapes: HTTP-redirects of the
   check request (the `Location` header is the login URL) and
   direct-200 HTML at the same URL. For the second shape, traytail
@@ -99,9 +108,12 @@ Detection details and hardening:
   through the portal's own DNS server (read from NM over DBus):
   IPv4 A-record resolvability plus TCP :80 reachability of control
   domains (`neverssl.com`, `tailscale.com`) against the always-allowed
-  Apple check domain. Control blocked + check alive (DNS or TCP) =
-  portal. No login URL is derivable there — use the portal page the
-  network redirects your browser to.
+  Apple check domain. Control TCP blocked + check alive = portal.
+  DNS-only failures are treated as insufficient evidence. If no
+  redirect URL was captured, the menu offers the discovered gateway as
+  `Open portal login (gateway)`. With no known gateway it shows `No
+  login URL discovered yet` instead of opening an external host that
+  the routing check has already found unreachable.
 - Apple's exact 69-byte `Success` body is used as a content-injection
   detector for hijack portals (a replaced body fails the match).
 - If the NM connectivity check is disabled entirely, traytail logs a
@@ -199,6 +211,20 @@ Custom location (no root needed):
 ```
 make install PREFIX=$HOME/.local/bin
 ```
+
+The recommended setup is the systemd service, which also grants
+`CAP_NET_ADMIN` (portal probes can bypass an active tailscale tunnel),
+restarts on failure, and starts on boot:
+
+```
+sudo make install-system USER=$USER
+journalctl -u traytail@$USER -f
+```
+
+Re-running `install-system` restarts the service so the running process
+always uses the just-installed binary. Logs also go to journald through
+`/dev/log` for any invocation, so `journalctl -t traytail -f` works
+whether or not the service is used.
 
 ## License
 

@@ -62,8 +62,10 @@ func run(ctx context.Context, args ...string) (string, error) {
 	cmd.Stderr = &errOut
 	err := cmd.Run()
 	if err != nil {
-		// errors carry stderr (CLI messages); callers show it
-		return strings.TrimSpace(errOut.String()), fmt.Errorf("tailscale %v: %w", args, err)
+		// The CLI reports errors on stdout AND stderr depending on the
+		// subcommand; include both so the log has the real reason.
+		msg := strings.TrimSpace(strings.TrimSpace(errOut.String()) + "\n" + strings.TrimSpace(out.String()))
+		return msg, fmt.Errorf("tailscale %v: %s: %w", args, msg, err)
 	}
 	// stdout only: the CLI prints "Warning: client version ..." lines to
 	// stderr during version mismatches, which used to poison JSON parses.

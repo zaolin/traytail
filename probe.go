@@ -110,7 +110,7 @@ var dnsServerFor = func(ctx context.Context) (string, error) {
 	defer conn.close()
 	mgr := conn.objectAt(nmPath)
 	var act dbus.ObjectPath
-	if err := getProperty(mgr, "", nmInterface, "PrimaryConnection", &act); err != nil {
+	if err := getProperty(ctx, mgr, "", nmInterface, "PrimaryConnection", &act); err != nil {
 		return "", err
 	}
 	if act == "" || act == "/" {
@@ -118,14 +118,14 @@ var dnsServerFor = func(ctx context.Context) (string, error) {
 	}
 	ac := conn.objectAt(act)
 	var ip4 dbus.ObjectPath
-	if err := getProperty(ac, string(act), nmDest+".Connection.Active", "Ip4Config", &ip4); err != nil {
+	if err := getProperty(ctx, ac, string(act), nmDest+".Connection.Active", "Ip4Config", &ip4); err != nil {
 		return "", err
 	}
 	if ip4 == "" || ip4 == "/" {
 		return "", fmt.Errorf("no Ip4Config")
 	}
 	var packed []uint32
-	if err := getProperty(conn.objectAt(ip4), string(ip4), nmDest+".IP4Config", "Nameservers", &packed); err != nil {
+	if err := getProperty(ctx, conn.objectAt(ip4), string(ip4), nmDest+".IP4Config", "Nameservers", &packed); err != nil {
 		return "", err
 	}
 	if len(packed) == 0 {
@@ -162,45 +162,35 @@ func aRecordsAreWalled(ctx context.Context, server, host string) bool {
 	return true // only IPv6 answers (NAT64 synthetic) = walled for v4
 }
 
-// selfCheckDNSWall runs the allowlist-vs-control matrix through the
-// portal DNS, extended with a routing-wall probe:
+// selfCheckDNSWall detects the *routing* wall used by allowlist
+// portals (wifionice class): the control domain's TCP :80 connection
+// fails consistently while the allowlisted check domain stays
+// reachable. DNS-only failure is deliberately NOT enough: filtered
+// home/enterprise resolvers (Pi-hole, AdGuard, policy DNS) can
+// NXDOMAIN control domains while normal internet works.
 //
-//  1. DNS wall: control domain has no A record while the check
-//     domain resolves -> portal (walled DNS / NXDOMAIN / NAT64-only).
-//  2. Routing wall: control domain's A record connects to :80 while
-//     the check domain's :80 stays dead (or both fine) — probe both
-//     TCP-wise; control blocked + check open -> portal (wifionice
-//     v4-routing style: DNS answers happily, TCP is walled).
-//
-// Returns (isPortal, nil) only on a clear VERDICT; (false, nil)
-// otherwise. The login URL is not derivable here (no redirect).
+// A DNS-wall reading without an A record contributes no actionable
+// evidence; it never disconnects tailscale by itself.
 func selfCheckDNSWall(ctx context.Context) (bool, error) {
 	server, err := dnsServerFor(ctx)
 	if err != nil {
 		return false, err
 	}
-	checkOK := !aRecordsAreWalled(ctx, server, wallCheckDomain)
-	if !checkOK {
-		// allowlisted check-domain doesn't resolve: DNS is simply dead
+	if aRecordsAreWalled(ctx, server, wallCheckDomain) {
+		// The allowlisted check domain doesn't resolve either: the
+		// resolver is dead, not evidence of a portal.
 		return false, nil
 	}
 	for _, host := range wallControlDomains {
-		// DNS wall needs the same consistency gate as the TCP wall:
-		// flaky resolvers (phone hotspot, train NAT) lose single
-		// lookups; a real wall fails EVERY attempt.
-		if controlDNSWallConsistently(ctx, server, host) {
-			return true, nil // walled A-records + alive allowlist = portal
-		}
-		// Routing wall: A-resolves but TCP :80 connect fails EVERY
-		// attempt while the check domain's :80 works (live-verified on
-		// wifionice; single-shot reads oscillate on shared NATs).
 		ips, rerr := resolveVia(ctx, server, host)
 		if rerr != nil || len(ips) == 0 {
+			// No usable A record: resolver filtering is possible, but
+			// that alone is not a portal verdict.
 			continue
 		}
 		if v4 := firstIPv4Record(ips); v4 != "" {
 			if controlWallConsistently(ctx, v4) && checkTCPOpen(ctx, server) {
-				return true, nil
+				return true, nil // control blocked, allowlist alive = wall
 			}
 		}
 	}
@@ -221,20 +211,13 @@ func controlWallConsistently(ctx context.Context, ip string) bool {
 		if tcpPortOpen(ctx, ip, 80) {
 			return false
 		}
-		time.Sleep(wallRetryGap)
-	}
-	return true
-}
-
-// controlDNSWallConsistently asks the portal DNS for the control
-// host's A-record wallAttempts times; only consistent failure counts
-// as walled (flaky resolvers lose single lookups).
-func controlDNSWallConsistently(ctx context.Context, server, host string) bool {
-	for i := 0; i < wallAttempts; i++ {
-		if !aRecordsAreWalled(ctx, server, host) {
+		timer := time.NewTimer(wallRetryGap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
 			return false
+		case <-timer.C:
 		}
-		time.Sleep(wallRetryGap)
 	}
 	return true
 }

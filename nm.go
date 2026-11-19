@@ -44,6 +44,7 @@ var clockNow = time.Now
 // tests can fake the manager object without a real bus.
 type nmObject interface {
 	Call(method string, flags dbus.Flags, args ...any) *dbus.Call
+	CallWithContext(ctx context.Context, method string, flags dbus.Flags, args ...any) *dbus.Call
 }
 
 // nmObjectAt resolves the object for a path on a connection-like type.
@@ -60,21 +61,64 @@ func (r *realConn) objectAt(path dbus.ObjectPath) nmObject {
 }
 func (r *realConn) close() error { return r.c.Close() }
 
-// realDial opens the system bus; seam for tests.
+var systemBusConnect = dbus.ConnectSystemBus
+
+// realDial opens a private system-bus connection; seam for tests.
+// godbus has no context-aware connect/authenticate API. The handoff lets
+// cancellation return promptly, while the connector closes any connection
+// that completes after its caller has gone away.
 var realDial = func(ctx context.Context) (nmConn, error) {
-	_ = ctx
-	c, err := dbus.SystemBus()
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &realConn{c: c}, nil
+	type result struct {
+		conn *dbus.Conn
+		err  error
+	}
+	// Unbuffered: connection ownership transfers only when the receiver
+	// accepts the result. Otherwise the connector retains it and closes it.
+	results := make(chan result)
+	go func() {
+		conn, err := systemBusConnect()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if conn != nil {
+				_ = conn.Close()
+				conn = nil
+			}
+			if err == nil {
+				err = ctxErr
+			}
+		}
+		r := result{conn: conn, err: err}
+		select {
+		case results <- r:
+		case <-ctx.Done():
+			if r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-results:
+		if r.err != nil {
+			return nil, r.err
+		}
+		if err := ctx.Err(); err != nil {
+			_ = r.conn.Close()
+			return nil, err
+		}
+		return &realConn{c: r.conn}, nil
+	}
 }
 
 // getProperty fetches a typed property from an arbitrary NM object.
 // Decodes the DBus variant into out's pointer type.
-func getProperty(obj nmObject, path, iface, name string, out any) error {
+func getProperty(ctx context.Context, obj nmObject, path, iface, name string, out any) error {
 	var v dbus.Variant
-	err := obj.Call(propInterface+".Get", 0, iface, name).Store(&v)
+	err := obj.CallWithContext(ctx, propInterface+".Get", 0, iface, name).Store(&v)
 	if err != nil {
 		return err
 	}
@@ -139,13 +183,13 @@ func (g *nmGate) connectivity(ctx context.Context) (int, error) {
 	obj := conn.objectAt(nmPath)
 
 	var enabled bool
-	if err := getProperty(obj, "", nmInterface, "ConnectivityCheckEnabled", &enabled); err == nil && !enabled {
+	if err := getProperty(ctx, obj, "", nmInterface, "ConnectivityCheckEnabled", &enabled); err == nil && !enabled {
 		if !g.warnedDisabled {
 			g.warnedDisabled = true
 			logWarnf("NetworkManager connectivity check is disabled ([connectivity] in NetworkManager.conf): portal detection inactive")
 		}
 		var state uint32
-		_ = getProperty(obj, "", nmInterface, "Connectivity", &state)
+		_ = getProperty(ctx, obj, "", nmInterface, "Connectivity", &state)
 		return int(state), nil
 	}
 
@@ -153,13 +197,13 @@ func (g *nmGate) connectivity(ctx context.Context) (int, error) {
 	if now.Sub(g.lastForce) >= forceInterval {
 		g.lastForce = now
 		var res dbus.Variant
-		if err := obj.Call(nmInterface+".CheckConnectivity", 0).Store(&res); err == nil {
+		if err := obj.CallWithContext(ctx, nmInterface+".CheckConnectivity", 0).Store(&res); err == nil {
 			state, _ := res.Value().(uint32)
 			return int(state), nil
 		}
 	}
 	var state uint32
-	if err := getProperty(obj, "", nmInterface, "Connectivity", &state); err != nil {
+	if err := getProperty(ctx, obj, "", nmInterface, "Connectivity", &state); err != nil {
 		return nmConnectivityUnknown, err
 	}
 	return int(state), nil
@@ -181,7 +225,7 @@ var nmCheckURIs = func(ctx context.Context) ([]string, error) {
 	defer conn.close()
 	obj := conn.objectAt(nmPath)
 	var uris []string
-	if err := getProperty(obj, "", nmInterface, "ConnectivityCheckUri", &uris); err != nil {
+	if err := getProperty(ctx, obj, "", nmInterface, "ConnectivityCheckUri", &uris); err != nil {
 		return nil, err
 	}
 	return uris, nil
@@ -196,7 +240,7 @@ func primaryGateway(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer conn.close()
-	gw, err := gatewayOn(conn)
+	gw, err := gatewayOn(ctx, conn)
 	if err != nil {
 		return "", err
 	}
@@ -205,22 +249,22 @@ func primaryGateway(ctx context.Context) (string, error) {
 
 // gatewayOn walks PrimaryConnection -> Ip4Config -> Gateway on one
 // connection (also used by the fake in tests).
-func gatewayOn(conn nmConn) (string, error) {
+func gatewayOn(ctx context.Context, conn nmConn) (string, error) {
 	mgr := conn.objectAt(nmPath)
 	var act dbus.ObjectPath
-	if err := getProperty(mgr, "", nmInterface, "PrimaryConnection", &act); err != nil {
+	if err := getProperty(ctx, mgr, "", nmInterface, "PrimaryConnection", &act); err != nil {
 		return "", err
 	}
 	if act == "" || act == "/" {
 		return "", fmt.Errorf("no primary connection")
 	}
 	var ip4 dbus.ObjectPath
-	if err := getProperty(mgr, "", nmInterface, "Ip4Config", &ip4); err != nil {
+	if err := getProperty(ctx, mgr, "", nmInterface, "Ip4Config", &ip4); err != nil {
 		return "", err
 	}
 	if ip4 == "" || ip4 == "/" {
 		ac := conn.objectAt(act)
-		if err := getProperty(ac, string(act), nmDest+".Connection.Active", "Ip4Config", &ip4); err != nil {
+		if err := getProperty(ctx, ac, string(act), nmDest+".Connection.Active", "Ip4Config", &ip4); err != nil {
 			return "", err
 		}
 	}
@@ -229,7 +273,7 @@ func gatewayOn(conn nmConn) (string, error) {
 	}
 	ipObj := conn.objectAt(ip4)
 	var gw string
-	if err := getProperty(ipObj, string(ip4), nmDest+".IP4Config", "Gateway", &gw); err != nil {
+	if err := getProperty(ctx, ipObj, string(ip4), nmDest+".IP4Config", "Gateway", &gw); err != nil {
 		return "", err
 	}
 	return gw, nil
@@ -400,16 +444,16 @@ var checkEnabledState = &struct {
 
 // nmCheckEnabledCached reports whether NM's connectivity check is on.
 // Falls back to the last known value when the bus is unreachable.
-// Var (not func) so the TestMain stub can replace it entirely.
-var nmCheckEnabledCached = func() bool {
-	conn, err := realDial(context.Background())
+// Var (not func) so tests can replace it entirely.
+var nmCheckEnabledCached = func(ctx context.Context) bool {
+	conn, err := realDial(ctx)
 	if err != nil {
 		return true // unknowable: assume enabled
 	}
 	defer conn.close()
 	obj := conn.objectAt(nmPath)
 	var enabled bool
-	if err := getProperty(obj, "", nmInterface, "ConnectivityCheckEnabled", &enabled); err != nil {
+	if err := getProperty(ctx, obj, "", nmInterface, "ConnectivityCheckEnabled", &enabled); err != nil {
 		checkEnabledState.mu.Lock()
 		last := checkEnabledState.enabled
 		checkEnabledState.mu.Unlock()
